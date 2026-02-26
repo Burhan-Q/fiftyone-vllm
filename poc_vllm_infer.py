@@ -3,8 +3,11 @@ from pathlib import Path
 
 from openai import OpenAI
 
-img = "https://vllm-public-assets.s3.us-west-2.amazonaws.com/vision_model_images/2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg"
+# NOTE: used 'compose.yml' as 'online' host emulation
+
+
 openai_api_key = "EMPTY"
+img = "https://vllm-public-assets.s3.us-west-2.amazonaws.com/vision_model_images/2560px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg"
 
 client = OpenAI(api_key=openai_api_key, base_url="http://localhost:8811/v1")
 

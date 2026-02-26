@@ -1,0 +1,20 @@
+services:
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: vllm
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ports:
+      - "8811:8000"
+    environment:
+      - HF_TOKEN=${HF_TOK}
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    ipc: host
+    command: --model Qwen/Qwen2.5-VL-3B-Instruct-AWQ --max-model-len 8192

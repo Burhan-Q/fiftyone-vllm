@@ -1,15 +1,17 @@
-# fo-vllm: FiftyOne + vLLM Plugin — Refined Implementation Plan
+# fo-vllm: FiftyOne + vLLM Plugin — Implementation Plan
 
 ## 1. Executive Summary
 
-This plugin integrates vLLM with FiftyOne to provide universal VLM inference over image datasets. It supports **any model vLLM can serve** (Qwen2.5-VL, LLaVA, InternVL, Pixtral, Llama Vision, Phi-Vision, Gemma, etc.) in both **online** (remote/local server) and **offline** (in-process GPU) modes.
+This plugin integrates vLLM with FiftyOne to provide universal VLM inference over image datasets via the **vLLM OpenAI-compatible API** (local or remote server). It supports **any model vLLM can serve** (Qwen2.5-VL, LLaVA, InternVL, Pixtral, Llama Vision, Phi-Vision, Gemma, etc.).
+
+> **Scope**: This version targets online mode only. Offline mode (in-process GPU via `vllm.LLM`) is deferred. The architecture preserves extension points for adding it later (see Section 12).
 
 **Key principles**:
 
 1. **All tasks use structured output — no exceptions**: Every VLM response is constrained by `StructuredOutputsParams`. Tasks producing FiftyOne labels use `json=` schemas; classification uses `choice=`. Tasks producing text (caption, VQA, OCR, custom) also use `json=` schemas wrapping the text in a named key (e.g., `{"text": "..."}`). There is zero free-text parsing anywhere in the plugin. Post-generation validation catches what token-level constraints cannot enforce (numeric ranges, cross-field relationships).
-2. **vLLM handles chat templates**: The plugin always sends OpenAI-format messages. vLLM automatically applies the correct chat template per model. Users may supply a custom chat template (as a raw string or file path) for models that lack one.
+2. **vLLM handles chat templates**: The plugin always sends OpenAI-format messages. vLLM automatically applies the correct chat template per model. Users configure custom chat templates on the vLLM server via `vllm serve --chat-template`.
 3. **Operates on FiftyOne datasets directly**: The single operator works on `ctx.target_view()` (dataset, view, or selected samples) and writes results via `set_values()`.
-4. **Parallel everything**: ThreadPool for image loading/encoding, async HTTP for online API calls, native batching for offline mode. Concurrency limits are user-configurable.
+4. **Parallel everything**: ThreadPool for image loading/encoding, async HTTP for API calls. Concurrency limits are user-configurable.
 
 **Core value**: One plugin, any VLM, any task, any scale.
 
@@ -42,7 +44,7 @@ Implement FiftyOne's `Model` class and use `view.apply_model()`.
 | Prompt support | Awkward — Model interface has no prompt concept |
 | Batch efficiency | Moderate — predict_all helps but images arrive as numpy |
 
-**Verdict**: The `fo.Model` interface was designed for traditional vision models (input: tensor, output: label). VLMs need prompts, structured output constraints, and work best with file paths, PIL images, or base64 — not numpy arrays.
+**Verdict**: The `fo.Model` interface was designed for traditional vision models (input: tensor, output: label). VLMs need prompts, structured output constraints, and work best with file paths or base64 — not numpy arrays.
 
 ### Design C: Hybrid Engine + Smart Operator (CHOSEN)
 
@@ -50,8 +52,8 @@ Separate `VLLMEngine` for inference, `TaskConfig` for prompts/structured output/
 
 | Aspect | Assessment |
 |--------|-----------|
-| Image handling | Optimal — PIL objects (offline) or base64/file paths (online), no numpy |
-| Batch efficiency | High — native vLLM batching, bulk set_values() writes |
+| Image handling | Optimal — base64 or file paths, no numpy |
+| Batch efficiency | High — async concurrent API calls, bulk set_values() writes |
 | Structured output | Full vLLM constrained generation (StructuredOutputsParams) |
 | Separation of concerns | Clean — engine, task config, and operator each have one job |
 
@@ -62,7 +64,7 @@ Separate `VLLMEngine` for inference, `TaskConfig` for prompts/structured output/
 | Design A | Direct control over batch loop | Avoids apply_model overhead for VLMs |
 | Design B | Reusable class external to operator | Engine can be used via SDK |
 | Design C | Parallel image prep + bulk writes | Maximum throughput |
-| Design C | Mode-aware image handling | PIL for offline (zero-copy lazy loading), base64/filepath for online |
+| Design C | Smart image handling | base64 for remote, file:// paths for local |
 | vLLM | `StructuredOutputsParams(choice=..., json=...)` | Enforced structured output at the token level |
 
 ---
@@ -89,26 +91,20 @@ Separate `VLLMEngine` for inference, `TaskConfig` for prompts/structured output/
  |                      |                                   |
  |               +------v-------+                           |
  |               |  VLLMEngine  |                           |
- |               |              |                           |
- |               | +----------+ |                           |
- |               | |  Online  | | AsyncOpenAI + semaphore    |
- |               | +----------+ |                           |
- |               | +----------+ |                           |
- |               | | Offline  | | vllm.LLM.chat() batch     |
- |               | +----------+ |                           |
+ |               | AsyncOpenAI  |                           |
+ |               | + semaphore  |                           |
  |               +--------------+                           |
  +---------------------------------------------------------+
 ```
 
-### Image flow by mode
+### Image flow
 
 ```
 Online (remote server):   filepath → ThreadPool base64 encode → image_url content → HTTP
 Online (local server):    filepath → file:// URL string (no I/O) → image_url content → HTTP
-Offline (in-process GPU): filepath → ThreadPool PIL.Image.open() → image_pil content → LLM.chat()
 ```
 
-The offline path uses PIL Image objects via vLLM's `image_pil` content type extension. `PIL.Image.open()` is lazy — it reads the file header but defers pixel decoding to vLLM's internal processor. This is the true zero-copy-from-disk path. The `file://` scheme is only supported by the vLLM HTTP server (with `--allowed-local-media-path`), **not** by the offline `LLM.chat()` API.
+The `file://` scheme is supported by the vLLM HTTP server (with `--allowed-local-media-path`). For remote servers, base64 encoding is the universally portable option.
 
 ---
 
@@ -118,12 +114,11 @@ The offline path uses PIL Image objects via vLLM's `image_pil` content type exte
 fo-vllm/
   fiftyone.yml              # Plugin manifest
   __init__.py               # register(plugin), operator imports
-  engine.py                 # VLLMEngine: online/offline inference + structured output
+  engine.py                 # VLLMEngine: online inference via AsyncOpenAI
   tasks.py                  # TaskConfig: prompts, JSON schemas, output parsers + validation
   operators.py              # FiftyOne operator: UI, batching, progress, result storage
   utils.py                  # Image loading/encoding, async helpers
   requirements.txt          # Core deps (openai, pillow) — installed by FiftyOne plugin system
-  requirements-local.txt    # Core + offline deps (adds vllm) — for manual/CI install
 ```
 
 ---
@@ -352,7 +347,6 @@ This means:
 **Engine mapping** (vLLM 0.16+ `StructuredOutputsParams` API):
 
 - **Online mode**: `extra_body={"structured_outputs": {"choice": [...]}}` or `extra_body={"structured_outputs": {"json": schema}}`
-- **Offline mode**: `StructuredOutputsParams(choice=[...])` or `StructuredOutputsParams(json=schema)` passed to `SamplingParams(structured_outputs=...)`
 
 ---
 
@@ -360,93 +354,35 @@ This means:
 
 ### 6.1 `VLLMEngine` (`engine.py`)
 
-Unified inference interface over both vLLM modes. Handles structured output constraints.
+Thin wrapper over vLLM's OpenAI-compatible API with structured output.
 
 ```python
 class VLLMEngine:
-    """Thin wrapper unifying online (API) and offline (in-process) vLLM."""
+    """Thin wrapper over vLLM's OpenAI-compatible API with structured output."""
 
     def __init__(
         self,
-        model: str,                             # HuggingFace model ID or path
-        mode: str = "online",                   # "online" | "offline"
-        # Online-only
+        model: str,
         base_url: str = "http://localhost:8000/v1",
         api_key: str = "EMPTY",
-        max_concurrent: int = 64,               # Semaphore limit for async calls
-        # Offline-only engine kwargs
-        tensor_parallel_size: int = 1,
-        gpu_memory_utilization: float = 0.9,
-        max_model_len: int | None = None,
-        dtype: str = "auto",
-        trust_remote_code: bool = True,
-        enforce_eager: bool = False,
-        limit_mm_per_prompt: dict | None = None,
-        chat_template: str | None = None,       # Raw Jinja2 string or file path
-        device: str | None = None,              # e.g., "cuda:0", "cuda:0,1", "auto"
-        # Sampling parameters (both modes)
+        max_concurrent: int = 64,
         temperature: float = 0.0,
         max_tokens: int = 512,
         top_p: float = 1.0,
         seed: int | None = None,
     ):
+        from openai import AsyncOpenAI
         self.model = model
-        self.mode = mode
+        self.base_url = base_url
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.top_p = top_p
         self.seed = seed
         self._max_concurrent = max_concurrent
-        self._chat_template = self._resolve_chat_template(chat_template)
-
-        if mode == "online":
-            from openai import AsyncOpenAI
-            self._aclient = AsyncOpenAI(
-                base_url=base_url, api_key=api_key
-            )
-            self._llm = None
-        elif mode == "offline":
-            try:
-                from vllm import LLM
-            except ImportError:
-                raise ImportError(
-                    "vllm>=0.16.0 is required for offline mode. "
-                    "Install with: pip install 'vllm>=0.16.0'"
-                )
-            # Set CUDA_VISIBLE_DEVICES if device specified
-            if device and device != "auto":
-                import os
-                os.environ["CUDA_VISIBLE_DEVICES"] = device.replace("cuda:", "")
-
-            self._llm = LLM(
-                model=model,
-                tensor_parallel_size=tensor_parallel_size,
-                gpu_memory_utilization=gpu_memory_utilization,
-                max_model_len=max_model_len,
-                dtype=dtype,
-                trust_remote_code=trust_remote_code,
-                enforce_eager=enforce_eager,
-                limit_mm_per_prompt=limit_mm_per_prompt or {"image": 1},
-            )
-            self._aclient = None
-
-    @staticmethod
-    def _resolve_chat_template(chat_template: str | None) -> str | None:
-        """Resolve chat template from raw string or file path."""
-        if chat_template is None:
-            return None
-        # If it looks like a file path and exists, read it
-        import os
-        if os.path.isfile(chat_template):
-            with open(chat_template, "r") as f:
-                return f.read()
-        # Otherwise treat as raw Jinja2 string
-        return chat_template
+        self._aclient = AsyncOpenAI(base_url=base_url, api_key=api_key)
 
     def list_models(self) -> list[str]:
-        """Query available models (online mode only)."""
-        if self.mode != "online":
-            return [self.model]
+        """Query available models from the vLLM server."""
         from openai import OpenAI
         sync_client = OpenAI(
             base_url=self._aclient.base_url, api_key=self._aclient.api_key
@@ -454,9 +390,7 @@ class VLLMEngine:
         return [m.id for m in sync_client.models.list().data]
 
     def validate_connection(self):
-        """Test server connectivity (online mode). Raises on failure."""
-        if self.mode != "online":
-            return
+        """Test server connectivity. Raises on failure."""
         models = self.list_models()
         if not models:
             raise ConnectionError("vLLM server returned no models")
@@ -477,17 +411,10 @@ class VLLMEngine:
 
         Returns list of response strings (valid JSON or choice-constrained string).
         """
-        if self.mode == "online":
-            return self._online_batch(messages, structured_outputs)
-        return self._offline_batch(messages, structured_outputs)
+        return _run_async(self._async_infer_batch(messages, structured_outputs))
 
-    def _online_batch(self, messages, structured_outputs) -> list[str]:
-        """Async concurrent OpenAI API calls with event-loop-safe execution."""
-        return _run_async(self._async_online_batch(messages, structured_outputs))
-
-    async def _async_online_batch(self, messages, structured_outputs) -> list[str]:
+    async def _async_infer_batch(self, messages, structured_outputs) -> list[str]:
         extra_body = {"structured_outputs": structured_outputs}
-
         sem = asyncio.Semaphore(self._max_concurrent)
 
         async def _call(msgs):
@@ -504,40 +431,6 @@ class VLLMEngine:
                 return resp.choices[0].message.content
 
         return list(await asyncio.gather(*[_call(m) for m in messages]))
-
-    def _offline_batch(self, messages, structured_outputs) -> list[str]:
-        """vLLM LLM.chat() native batch inference with structured output."""
-        from vllm import SamplingParams
-        from vllm.sampling_params import StructuredOutputsParams
-
-        so_params = StructuredOutputsParams(**structured_outputs)
-
-        params = SamplingParams(
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
-            top_p=self.top_p,
-            seed=self.seed,
-            structured_outputs=so_params,
-        )
-
-        chat_kwargs = {}
-        if self._chat_template:
-            chat_kwargs["chat_template"] = self._chat_template
-
-        outputs = self._llm.chat(messages, sampling_params=params, **chat_kwargs)
-        return [o.outputs[0].text for o in outputs]
-
-    def cleanup(self):
-        """Free GPU memory (offline mode)."""
-        if hasattr(self, "_llm") and self._llm is not None:
-            del self._llm
-            self._llm = None
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except ImportError:
-                pass
 
 
 import asyncio
@@ -660,11 +553,7 @@ class TaskConfig:
         self.prompt = raw_prompt.format(**fmt_kwargs) if fmt_kwargs else raw_prompt
 
     def build_messages(self, image_content: dict) -> list[dict]:
-        """Build OpenAI-format messages for one image.
-
-        Works with both online mode (image_url content) and
-        offline mode (image_pil content via vLLM extension).
-        """
+        """Build OpenAI-format messages for one image."""
         messages = []
         if self.system_prompt:
             messages.append({"role": "system", "content": self.system_prompt})
@@ -689,9 +578,7 @@ class TaskConfig:
 
         Every task returns a structured output constraint. Never returns None.
 
-        Used as:
-          - Online: extra_body={"structured_outputs": result}
-          - Offline: StructuredOutputsParams(**result) → SamplingParams(structured_outputs=...)
+        Used as: extra_body={"structured_outputs": result}
         """
         if self.task == "classify" and self.classes:
             return {"choice": self.classes}
@@ -873,70 +760,52 @@ class TaskConfig:
 
 ### 6.3 Image Content Builder (`utils.py`)
 
-Parallel construction of image content objects from file paths, mode-aware.
+Parallel construction of image content objects from file paths.
 
 ```python
 import base64
 import mimetypes
 import os
 from concurrent.futures import ThreadPoolExecutor
-from PIL import Image
 
 
 def build_image_contents(
     filepaths: list[str],
-    mode: str = "online",
     image_mode: str = "auto",
     base_url: str | None = None,
     max_workers: int = 8,
 ) -> list[dict]:
     """Build image content dicts for vLLM chat messages.
 
-    Returns OpenAI-format dicts for online mode, or vLLM-extended
-    dicts with image_pil for offline mode. All I/O-bound work is
-    parallelized via ThreadPoolExecutor.
+    Returns OpenAI-format image_url content dicts. All I/O-bound
+    work is parallelized via ThreadPoolExecutor.
 
     Args:
         filepaths: absolute paths to image files.
-        mode: "online" or "offline" — determines valid content types.
-        image_mode: "auto" | "base64" | "filepath" | "pil"
-            - "auto": pil for offline; filepath for local online; base64 for remote online
-            - "filepath": file:// URL strings (online local servers only, no I/O)
+        image_mode: "auto" | "base64" | "filepath"
+            - "auto": filepath for local servers; base64 for remote
+            - "filepath": file:// URL strings (local servers only, no I/O)
             - "base64": base64 data URIs (works everywhere, parallel I/O)
-            - "pil": PIL.Image objects (offline only, lazy-loaded)
         base_url: vLLM server URL, used by "auto" to detect local servers.
-        max_workers: ThreadPoolExecutor size for parallel loading/encoding.
+        max_workers: ThreadPoolExecutor size for parallel encoding.
     """
-    resolved = _resolve_image_mode(mode, image_mode, base_url)
+    resolved = _resolve_image_mode(image_mode, base_url)
 
     if resolved == "filepath":
         # No I/O — instant
         return [_filepath_content(fp) for fp in filepaths]
-    elif resolved == "pil":
-        # PIL.Image.open() is lazy — reads header only, defers pixel decode to vLLM
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            images = list(pool.map(Image.open, filepaths))
-        return [{"type": "image_pil", "image_pil": img} for img in images]
     elif resolved == "base64":
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            encoded = list(pool.map(_encode_base64, filepaths))
-        return encoded
+            return list(pool.map(_encode_base64, filepaths))
     else:
-        raise ValueError(f"Unknown resolved image mode: {resolved}")
+        raise ValueError(f"Unknown image mode: {resolved}")
 
 
-def _resolve_image_mode(mode, image_mode, base_url):
+def _resolve_image_mode(image_mode, base_url):
     """Resolve the effective image mode from user settings and context."""
     if image_mode != "auto":
-        # Validate mode/image_mode compatibility
-        if mode == "offline" and image_mode == "filepath":
-            # file:// not supported by LLM.chat() — fall back to pil
-            return "pil"
         return image_mode
-    # Auto resolution
-    if mode == "offline":
-        return "pil"
-    # Online auto-detection: local server can use file paths
+    # Auto-detection: local server can use file paths
     if base_url and any(h in base_url for h in ("localhost", "127.0.0.1", "0.0.0.0")):
         return "filepath"
     return "base64"
@@ -992,15 +861,13 @@ class VLLMInference(foo.Operator):
     def resolve_input(self, ctx):
         inputs = types.Object()
 
-        mode = _mode_selector(ctx, inputs)
         _model_selector(ctx, inputs)
-        if mode == "online":
-            _server_settings(ctx, inputs)
+        _server_settings(ctx, inputs)
         task = _task_selector(ctx, inputs)
         _task_settings(ctx, inputs, task)
         _output_settings(ctx, inputs, task)
         _field_conflict_check(ctx, inputs, task)
-        _advanced_settings(ctx, inputs, mode)
+        _advanced_settings(ctx, inputs)
         inputs.view_target(ctx)
 
         return types.Property(inputs, view=types.View(label="vLLM Inference"))
@@ -1023,130 +890,111 @@ class VLLMInference(foo.Operator):
             or "http://localhost:8000/v1"
         )
 
-        # 2. Resolve chat template
-        chat_template = params.get("chat_template") or None
-
-        # 3. Resolve device for offline mode
-        device = params.get("device") or None
-
-        # 4. Build engine
+        # 2. Build engine
         engine = VLLMEngine(
             model=params["model"],
-            mode=params.get("mode", "online"),
             base_url=base_url,
             api_key=api_key,
             max_concurrent=params.get("max_concurrent", 64),
             temperature=params.get("temperature", None),  # resolved below
             max_tokens=params.get("max_tokens", 512),
             top_p=params.get("top_p", 1.0),
-            # Offline-only
-            tensor_parallel_size=params.get("tensor_parallel_size", 1),
-            gpu_memory_utilization=params.get("gpu_memory_utilization", 0.9),
-            max_model_len=params.get("max_model_len") or None,
-            chat_template=chat_template,
-            device=device,
         )
 
-        try:
-            # 5. Validate connection (online mode)
-            if engine.mode == "online":
-                engine.validate_connection()
+        # 3. Validate connection
+        engine.validate_connection()
 
-            # 6. Build task config
-            classes = None
-            raw_classes = params.get("classes")
-            if raw_classes:
-                classes = [c.strip() for c in raw_classes.split(",")]
+        # 4. Build task config
+        classes = None
+        raw_classes = params.get("classes")
+        if raw_classes:
+            classes = [c.strip() for c in raw_classes.split(",")]
 
-            task = TaskConfig(
-                task=params["task"],
-                prompt=params.get("prompt_override") or params.get("prompt"),
-                system_prompt=params.get("system_prompt"),
-                classes=classes,
-                coordinate_format=params.get("coordinate_format", "normalized_1000"),
-                question=params.get("question", ""),
+        task = TaskConfig(
+            task=params["task"],
+            prompt=params.get("prompt_override") or params.get("prompt"),
+            system_prompt=params.get("system_prompt"),
+            classes=classes,
+            coordinate_format=params.get("coordinate_format", "normalized_1000"),
+            question=params.get("question", ""),
+        )
+
+        # Apply task-specific temperature default if user didn't override
+        if params.get("temperature") is None:
+            engine.temperature = task.default_temperature
+
+        # 5. Get target samples
+        view = ctx.target_view()
+        ids = view.values("id")
+        filepaths = view.values("filepath")
+        total = len(ids)
+        batch_size = params.get("batch_size", 32)
+        output_field = params["output_field"]
+        max_workers = params.get("max_workers", 8)
+
+        # Get structured output constraints from task
+        structured_outputs = task.get_structured_outputs()
+
+        # 6. Process in batches
+        processed = 0
+        total_errors = 0
+
+        for i in range(0, total, batch_size):
+            batch_ids = ids[i:i + batch_size]
+            batch_paths = filepaths[i:i + batch_size]
+
+            # 6a. Parallel image content construction
+            image_contents = build_image_contents(
+                batch_paths,
+                image_mode=params.get("image_mode", "auto"),
+                base_url=base_url,
+                max_workers=max_workers,
             )
 
-            # Apply task-specific temperature default if user didn't override
-            if params.get("temperature") is None:
-                engine.temperature = task.default_temperature
+            # 6b. Build messages for each image
+            batch_messages = [task.build_messages(img) for img in image_contents]
 
-            # 7. Get target samples
-            view = ctx.target_view()
-            ids = view.values("id")
-            filepaths = view.values("filepath")
-            total = len(ids)
-            batch_size = params.get("batch_size", 32)
-            output_field = params["output_field"]
-            max_workers = params.get("max_workers", 8)
+            # 6c. Batch inference with structured output
+            responses = engine.infer_batch(
+                batch_messages,
+                structured_outputs=structured_outputs,
+            )
 
-            # Get structured output constraints from task
-            structured_outputs = task.get_structured_outputs()
+            # 6d. Parse responses with per-sample error handling
+            results = {}
+            errors = {}
+            for sid, resp in zip(batch_ids, responses):
+                try:
+                    results[sid] = task.parse_response(resp)
+                except Exception as e:
+                    errors[sid] = f"{type(e).__name__}: {e}"
+                    total_errors += 1
 
-            # 8. Process in batches
-            processed = 0
-            total_errors = 0
-
-            for i in range(0, total, batch_size):
-                batch_ids = ids[i:i + batch_size]
-                batch_paths = filepaths[i:i + batch_size]
-
-                # 8a. Parallel image content construction
-                image_contents = build_image_contents(
-                    batch_paths,
-                    mode=engine.mode,
-                    image_mode=params.get("image_mode", "auto"),
-                    base_url=base_url,
-                    max_workers=max_workers,
+            # 6e. Bulk-write results and errors
+            if results:
+                ctx.dataset.set_values(output_field, results, key_field="id")
+            if errors:
+                ctx.dataset.set_values(
+                    f"{output_field}_error", errors, key_field="id"
                 )
 
-                # 8b. Build messages for each image
-                batch_messages = [task.build_messages(img) for img in image_contents]
+            # 6f. Progress
+            processed += len(batch_ids)
+            label = f"{processed}/{total} samples"
+            if total_errors:
+                label += f" ({total_errors} errors)"
 
-                # 8c. Batch inference with structured output
-                responses = engine.infer_batch(
-                    batch_messages,
-                    structured_outputs=structured_outputs,
+            if ctx.delegated:
+                ctx.set_progress(progress=processed / total, label=label)
+            else:
+                yield ctx.trigger(
+                    "set_progress",
+                    dict(progress=processed / total, label=label),
                 )
 
-                # 8d. Parse responses with per-sample error handling
-                results = {}
-                errors = {}
-                for sid, resp in zip(batch_ids, responses):
-                    try:
-                        results[sid] = task.parse_response(resp)
-                    except Exception as e:
-                        errors[sid] = f"{type(e).__name__}: {e}"
-                        total_errors += 1
-
-                # 8e. Bulk-write results and errors
-                if results:
-                    ctx.dataset.set_values(output_field, results, key_field="id")
-                if errors:
-                    ctx.dataset.set_values(
-                        f"{output_field}_error", errors, key_field="id"
-                    )
-
-                # 8f. Progress
-                processed += len(batch_ids)
-                label = f"{processed}/{total} samples"
-                if total_errors:
-                    label += f" ({total_errors} errors)"
-
-                if ctx.delegated:
-                    ctx.set_progress(progress=processed / total, label=label)
-                else:
-                    yield ctx.trigger(
-                        "set_progress",
-                        dict(progress=processed / total, label=label),
-                    )
-
-            # 9. Reload dataset in App
-            if not ctx.delegated:
-                yield ctx.trigger("reload_dataset")
-
-        finally:
-            engine.cleanup()
+        # 7. Reload dataset in App
+        if not ctx.delegated:
+            yield ctx.trigger("reload_dataset")
 
     def resolve_output(self, ctx):
         outputs = types.Object()
@@ -1158,50 +1006,7 @@ class VLLMInference(foo.Operator):
 
 ## 7. Operator UI Specification
 
-### 7.1 `_mode_selector(ctx, inputs)`
-
-```python
-def _mode_selector(ctx, inputs):
-    mode_radio = types.RadioGroup(orientation="horizontal")
-    mode_radio.add_choice(
-        "online",
-        label="Online",
-        description="Connect to a vLLM API server",
-    )
-    mode_radio.add_choice(
-        "offline",
-        label="Offline",
-        description="Run vLLM locally (requires GPU + vllm package)",
-    )
-    inputs.enum(
-        "mode",
-        mode_radio.values(),
-        default="online",
-        required=True,
-        label="Inference Mode",
-        view=mode_radio,
-    )
-    mode = ctx.params.get("mode", "online")
-
-    if mode == "offline":
-        try:
-            import vllm
-            from packaging.version import Version
-            if Version(vllm.__version__) < Version("0.16.0"):
-                inputs.view("vllm_version", types.Error(
-                    label=f"vllm>=0.16.0 required, found {vllm.__version__}. "
-                          f"Upgrade with: pip install 'vllm>=0.16.0'"
-                ))
-        except ImportError:
-            inputs.view("vllm_missing", types.Error(
-                label="vllm>=0.16.0 is required for offline mode. "
-                      "Install with: pip install 'vllm>=0.16.0'"
-            ))
-
-    return mode
-```
-
-### 7.2 `_model_selector(ctx, inputs)`
+### 7.1 `_model_selector(ctx, inputs)`
 
 ```python
 def _model_selector(ctx, inputs):
@@ -1213,7 +1018,7 @@ def _model_selector(ctx, inputs):
     )
 ```
 
-### 7.3 `_server_settings(ctx, inputs)`
+### 7.2 `_server_settings(ctx, inputs)`
 
 ```python
 def _server_settings(ctx, inputs):
@@ -1233,7 +1038,7 @@ def _server_settings(ctx, inputs):
     )
 ```
 
-### 7.4 `_task_selector(ctx, inputs)`
+### 7.3 `_task_selector(ctx, inputs)`
 
 ```python
 def _task_selector(ctx, inputs):
@@ -1262,7 +1067,7 @@ def _task_selector(ctx, inputs):
     return ctx.params.get("task", None)
 ```
 
-### 7.5 `_task_settings(ctx, inputs, task)`
+### 7.4 `_task_settings(ctx, inputs, task)`
 
 ```python
 def _task_settings(ctx, inputs, task):
@@ -1297,7 +1102,7 @@ def _task_settings(ctx, inputs, task):
             description="Override the default prompt for this task")
 ```
 
-### 7.6 `_output_settings(ctx, inputs, task)`
+### 7.5 `_output_settings(ctx, inputs, task)`
 
 Each task has its own default field name to prevent type conflicts.
 
@@ -1313,7 +1118,7 @@ def _output_settings(ctx, inputs, task):
     )
 ```
 
-### 7.7 `_field_conflict_check(ctx, inputs, task)`
+### 7.6 `_field_conflict_check(ctx, inputs, task)`
 
 Warn early if the output field already exists with an incompatible type.
 
@@ -1350,12 +1155,10 @@ def _field_conflict_check(ctx, inputs, task):
         )
 ```
 
-### 7.8 `_advanced_settings(ctx, inputs, mode)`
-
-Includes concurrency controls, chat template override, and device selection.
+### 7.7 `_advanced_settings(ctx, inputs)`
 
 ```python
-def _advanced_settings(ctx, inputs, mode):
+def _advanced_settings(ctx, inputs):
     inputs.view("adv_header", types.Header(label="Advanced Settings", divider=True))
     inputs.bool(
         "show_advanced", label="Show advanced settings",
@@ -1364,7 +1167,7 @@ def _advanced_settings(ctx, inputs, mode):
     if not ctx.params.get("show_advanced", False):
         return
 
-    # -- Sampling parameters (all modes) --
+    # -- Sampling parameters --
     inputs.float("temperature", label="Temperature",
         default=None, min=0.0, max=2.0,
         description="Sampling temperature (leave empty for task-specific default)")
@@ -1377,10 +1180,9 @@ def _advanced_settings(ctx, inputs, mode):
         description="Number of samples per inference batch")
 
     # -- Parallelism controls --
-    if mode == "online":
-        inputs.int("max_concurrent", label="Max Concurrent Requests",
-            default=64, min=1, max=256,
-            description="Maximum parallel HTTP requests to vLLM server")
+    inputs.int("max_concurrent", label="Max Concurrent Requests",
+        default=64, min=1, max=256,
+        description="Maximum parallel HTTP requests to vLLM server")
     inputs.int("max_workers", label="Image Loading Workers",
         default=8, min=1, max=32,
         description="Thread pool size for parallel image loading/encoding")
@@ -1388,21 +1190,13 @@ def _advanced_settings(ctx, inputs, mode):
     # -- Image handling --
     image_dropdown = types.Dropdown()
     image_dropdown.add_choice("auto", label="Auto",
-        description="Best option based on mode and server location")
+        description="Best option based on server location")
     image_dropdown.add_choice("base64", label="Base64",
         description="Base64-encoded (works everywhere)")
-    if mode == "online":
-        image_dropdown.add_choice("filepath", label="File Path",
-            description="file:// paths (local servers with --allowed-local-media-path)")
-    if mode == "offline":
-        image_dropdown.add_choice("pil", label="PIL Image",
-            description="PIL Image objects (recommended for offline mode)")
+    image_dropdown.add_choice("filepath", label="File Path",
+        description="file:// paths (local servers with --allowed-local-media-path)")
     inputs.enum("image_mode", image_dropdown.values(),
         default="auto", label="Image Mode", view=image_dropdown)
-
-    # -- Chat template override --
-    inputs.str("chat_template", label="Chat Template", required=False,
-        description="Raw Jinja2 chat template string or file path (for models without a built-in template, e.g., LLaVA-1.5)")
 
     # -- Detection coordinate format --
     task = ctx.params.get("task")
@@ -1415,64 +1209,15 @@ def _advanced_settings(ctx, inputs, mode):
             default="normalized_1000", label="Coordinate Format",
             view=coord_dropdown,
             description="Bounding box coordinate convention used by the model")
-
-    # -- Offline-only engine settings --
-    if mode == "offline":
-        inputs.view("offline_header", types.Header(
-            label="Offline Engine Settings", divider=True))
-        inputs.int("tensor_parallel_size", label="Tensor Parallel Size",
-            default=1, min=1, max=8,
-            description="Number of GPUs for tensor parallelism")
-        inputs.float("gpu_memory_utilization", label="GPU Memory Utilization",
-            default=0.9, min=0.1, max=1.0,
-            description="Fraction of GPU memory to use")
-        inputs.int("max_model_len", label="Max Model Length",
-            default=0, min=0, max=131072,
-            description="Max context length (0 = auto from model config)")
-
-        # GPU device selection
-        _device_selector(ctx, inputs)
-
-
-def _device_selector(ctx, inputs):
-    """GPU device selection for offline mode."""
-    try:
-        import torch
-        if not torch.cuda.is_available():
-            inputs.view("no_gpu", types.Warning(label="No GPU detected"))
-            return
-        num_gpus = torch.cuda.device_count()
-    except ImportError:
-        num_gpus = 0
-
-    if num_gpus == 0:
-        inputs.view("no_gpu", types.Warning(label="No GPU detected"))
-        return
-
-    device_choices = types.Dropdown()
-    device_choices.add_choice("auto", label="Auto (all available GPUs)")
-    for i in range(num_gpus):
-        try:
-            name = torch.cuda.get_device_name(i)
-            device_choices.add_choice(str(i), label=f"GPU {i}: {name}")
-        except Exception:
-            device_choices.add_choice(str(i), label=f"GPU {i}")
-
-    inputs.enum(
-        "device", device_choices.values(),
-        default="auto", label="GPU Device",
-        view=device_choices,
-        description="GPU device(s) for offline inference",
-    )
 ```
 
 ---
 
 ## 8. Critical Technical Decisions
 
-### 8.1 Chat Templates Are Handled by vLLM — With User Override
+### 8.1 Chat Templates Are Handled by vLLM
 
-Both `LLM.chat()` (offline) and `/v1/chat/completions` (online) automatically apply the correct Jinja2 chat template per model. The plugin always uses the universal OpenAI message format. For models without a built-in template (e.g., LLaVA-1.5), users can supply a custom template as a raw Jinja2 string or a file path via the advanced settings. The template resolution is deterministic: same model + same template = same prompt formatting every time.
+The `/v1/chat/completions` endpoint automatically applies the correct Jinja2 chat template per model. The plugin always uses the universal OpenAI message format. For models without a built-in template (e.g., LLaVA-1.5), configure the chat template on the vLLM server via `vllm serve --chat-template <path>`. This is a server-side concern, not a plugin concern.
 
 ### 8.2 Structured Output is Universal
 
@@ -1490,35 +1235,20 @@ Both `LLM.chat()` (offline) and `/v1/chat/completions` (online) automatically ap
 
 | Scenario | Strategy | Content type | Why |
 |----------|----------|-------------|-----|
-| Offline mode | PIL.Image.open() | `image_pil` | Lazy-loaded; vLLM decodes pixels internally; **file:// is not supported by LLM.chat()** |
-| Online, local server | `file://` paths | `image_url` | Zero I/O; requires `--allowed-local-media-path` on server |
-| Online, remote server | Parallel base64 | `image_url` | Only universally portable option |
+| Local server | `file://` paths | `image_url` | Zero I/O; requires `--allowed-local-media-path` on server |
+| Remote server | Parallel base64 | `image_url` | Only universally portable option |
 
 ### 8.4 Bulk Writes via `set_values()`
 
 `dataset.set_values(field, {id: value, ...}, key_field="id")` performs a single bulk MongoDB write per batch. Dramatically faster than per-sample `save()`.
 
-### 8.5 Offline Mode: Single LLM Instance
-
-The `vllm.LLM` object is instantiated once and reused for all batches. vLLM automatically manages batching within `LLM.chat()` calls based on available KV cache memory, regardless of how many messages are passed. The `batch_size` parameter in the operator controls how many samples are prepared and sent to vLLM at once, not vLLM's internal batch scheduling. Cleaned up in `engine.cleanup()` via the operator's `finally` block.
-
-### 8.6 Online Mode: Async Concurrency
+### 8.5 Async Concurrency
 
 `AsyncOpenAI` with `asyncio.Semaphore(max_concurrent)` wrapped in `_run_async()` for event-loop safety. All requests in a batch are fired concurrently. The semaphore prevents overwhelming the server. vLLM's continuous batching handles the rest. The `_run_async()` helper detects existing event loops (e.g., FiftyOne's App server) and runs async code in a dedicated thread to avoid `RuntimeError`.
 
-### 8.7 Detection Coordinate Convention
+### 8.6 Detection Coordinate Convention
 
 Configurable via `coordinate_format` advanced setting. Default is `normalized_1000` matching Qwen2-VL/Qwen2.5-VL/Qwen3-VL's native grounding format. Detection accuracy and coordinate format vary significantly across model families — this task is not "universal" in the way classification and captioning are. The system prompt reflects the chosen coordinate convention.
-
-### 8.8 GPU Device Selection
-
-For offline mode, users can select specific GPU device(s). The selection maps to `CUDA_VISIBLE_DEVICES`:
-
-| Selection | Behavior |
-|-----------|----------|
-| `auto` | All available GPUs (vLLM manages) |
-| Single GPU (e.g., `0`) | `CUDA_VISIBLE_DEVICES=0` |
-| Multiple GPUs require `tensor_parallel_size` ≥ 2 |
 
 ---
 
@@ -1534,7 +1264,6 @@ import fiftyone.operators as foo
 foo.execute_operator(
     "@fo-vllm/run_vllm_inference",
     params={
-        "mode": "online",
         "model": "Qwen/Qwen2.5-VL-7B-Instruct",
         "base_url": "http://localhost:8000/v1",
         "task": "classify",
@@ -1551,11 +1280,11 @@ from fo_vllm.tasks import TaskConfig
 from fo_vllm.utils import build_image_contents
 
 dataset = fo.load_dataset("my_dataset")
-engine = VLLMEngine(model="Qwen/Qwen2.5-VL-7B-Instruct", mode="online")
+engine = VLLMEngine(model="Qwen/Qwen2.5-VL-7B-Instruct")
 task = TaskConfig(task="classify", classes=["indoor", "outdoor"])
 
 filepaths = dataset.values("filepath")
-images = build_image_contents(filepaths, mode="online", image_mode="base64")
+images = build_image_contents(filepaths, image_mode="base64")
 messages = [task.build_messages(img) for img in images]
 responses = engine.infer_batch(
     messages,
@@ -1570,7 +1299,6 @@ for sid, r in zip(dataset.values("id"), responses):
         pass  # handle errors
 
 dataset.set_values("scene_type", results, key_field="id")
-engine.cleanup()
 ```
 
 ---
@@ -1581,22 +1309,17 @@ engine.cleanup()
 
 **Track A: `engine.py` + `utils.py`**
 
-1. `VLLMEngine.__init__()` for online mode (AsyncOpenAI client setup)
-2. `_async_online_batch()` with semaphore + event-loop-safe `_run_async()`
-3. `build_image_contents()` — filepath mode (string formatting, no I/O)
-4. `build_image_contents()` — base64 mode (ThreadPoolExecutor parallel I/O)
-5. `build_image_contents()` — pil mode (ThreadPoolExecutor parallel PIL.Image.open)
-6. `build_image_contents()` — auto-detection logic (mode-aware)
-7. `VLLMEngine.__init__()` for offline mode (lazy vllm import, `LLM()` instantiation, device selection)
-8. `_offline_batch()` using `LLM.chat()` with `StructuredOutputsParams` + optional `chat_template`
-9. `cleanup()` with GPU memory freeing
-10. `list_models()` and `validate_connection()` for online mode
-11. `_resolve_chat_template()` — file path or raw string
+1. `VLLMEngine.__init__()` — AsyncOpenAI client setup, sampling params
+2. `_async_infer_batch()` with semaphore + event-loop-safe `_run_async()`
+3. `list_models()` and `validate_connection()`
+4. `build_image_contents()` — filepath mode (string formatting, no I/O)
+5. `build_image_contents()` — base64 mode (ThreadPoolExecutor parallel I/O)
+6. `build_image_contents()` — auto-detection logic
 
 **Track B: `tasks.py`**
 
 1. `TaskConfig.__init__()` with 7 task defaults (all with JSON system prompts), prompt template formatting, coordinate_format
-2. `build_messages()` — works with both `image_url` and `image_pil` content types
+2. `build_messages()` — builds OpenAI-format message list with image content
 3. `get_structured_outputs()` — returns `dict` (never `None`) for all 7 tasks: choice for classify, json schemas for all others
 4. `parse_response()` for string tasks (caption, vqa, ocr, custom — `json.loads()` → extract named key)
 5. `parse_response()` for Classification (classify — direct label from structured choice)
@@ -1608,35 +1331,33 @@ engine.cleanup()
 **Track C: `operators.py` + `__init__.py` + `fiftyone.yml`** (depends on Phase 1)
 
 1. `fiftyone.yml` manifest
-2. `_mode_selector()` — RadioGroup for online/offline
-3. `_model_selector()` — text input for model ID
-4. `_server_settings()` — base_url and api_key fields (conditional on online mode)
-5. `_task_selector()` — Dropdown with 7 task choices
-6. `_task_settings()` — conditional fields per task
-7. `_output_settings()` — task-specific default field names
-8. `_field_conflict_check()` — early warning for field type conflicts
-9. `_advanced_settings()` — sampling params, concurrency controls, image mode, chat template, coordinate format, device selector, offline engine settings
-10. `execute()` — connection validation, batch loop, image prep, inference, per-sample error handling, set_values, progress
-11. `resolve_delegation()` and `resolve_output()`
-12. `__init__.py` with `register()` function
-13. `requirements.txt`
+2. `_model_selector()` — text input for model ID
+3. `_server_settings()` — base_url and api_key fields
+4. `_task_selector()` — Dropdown with 7 task choices
+5. `_task_settings()` — conditional fields per task
+6. `_output_settings()` — task-specific default field names
+7. `_field_conflict_check()` — early warning for field type conflicts
+8. `_advanced_settings()` — sampling params, concurrency controls, image mode, coordinate format
+9. `execute()` — connection validation, batch loop, image prep, inference, per-sample error handling, set_values, progress
+10. `resolve_delegation()` and `resolve_output()`
+11. `__init__.py` with `register()` function
+12. `requirements.txt`
 
 ### Phase 3: Testing
 
-1. Online mode: classify with `structured_outputs(choice=)` against a vLLM server
-2. Online mode: tag with `structured_outputs(json=)`
-3. Online mode: caption with `structured_outputs(json={"text": string})` — verify JSON wrapper
-4. Online mode: detect with `structured_outputs(json=)` + coordinate validation
-5. Online mode: vqa with `structured_outputs(json={"answer": string})` — verify JSON wrapper
-6. Offline mode: classify + tag + caption using `LLM.chat()` with `image_pil`
-7. Offline mode: detect with custom `chat_template`
-7. Progress reporting (immediate and delegated)
-8. Image modes: base64, filepath, pil (verify correct resolution per mode)
-9. Per-sample error handling: corrupted image in batch, truncated JSON response
-10. Event loop safety: online mode called from within FiftyOne App server
-11. Field conflict detection: re-run with incompatible output field
-12. Edge cases: empty dataset, missing files, model errors, max_tokens too low for JSON
-13. Device selection: single GPU, multi-GPU with tensor parallelism
+1. Classify with `structured_outputs(choice=)` against a vLLM server
+2. Tag with `structured_outputs(json=)`
+3. Caption with `structured_outputs(json={"text": string})` — verify JSON wrapper
+4. Detect with `structured_outputs(json=)` + coordinate validation
+5. VQA with `structured_outputs(json={"answer": string})` — verify JSON wrapper
+6. OCR with `structured_outputs(json={"text": string})` — verify JSON wrapper
+7. Custom with `structured_outputs(json={"response": string})`
+8. Progress reporting (immediate and delegated)
+9. Image modes: base64, filepath (verify correct resolution)
+10. Per-sample error handling: corrupted image in batch, truncated JSON response
+11. Event loop safety: called from within FiftyOne App server
+12. Field conflict detection: re-run with incompatible output field
+13. Edge cases: empty dataset, missing files, model errors, max_tokens too low for JSON
 
 ### Parallelization Summary
 
@@ -1660,7 +1381,7 @@ name: "@fo-vllm/vllm"
 type: plugin
 author: "fo-vllm contributors"
 version: "0.1.0"
-description: "Universal VLM inference via vLLM — any model, any task, online or offline"
+description: "Universal VLM inference via vLLM — any model, any task, any scale"
 fiftyone:
   version: ">=0.25"
 operators:
@@ -1672,65 +1393,20 @@ secrets:
 
 ### `requirements.txt`
 
-Core dependencies installed by FiftyOne's plugin system (`fiftyone plugins requirements <n> --install`):
-
 ```
 openai>=1.0
 pillow>=9.0
 ```
 
-These are sufficient for **online mode**. They are lightweight and have no GPU/CUDA requirements.
-
-### `requirements-local.txt`
-
-For users who want offline mode or prefer a one-command install:
-
-```
-# requirements-local.txt
-# Install with: pip install -r requirements-local.txt
-openai>=1.0
-pillow>=9.0
-vllm>=0.16.0
-```
-
-This file is **not** consumed by FiftyOne's plugin system (which only reads `requirements.txt`), but is provided for CI/CD pipelines, Docker images, and users who want a single `pip install -r` command.
-
-### Dependency strategy rationale
-
-FiftyOne plugins use a flat `requirements.txt` read by `fop.ensure_plugin_requirements()`. There is no native support for extras, optional groups, or multiple requirements files in the FiftyOne plugin ecosystem. Grouped/optional dependencies via `pyproject.toml` would require users to `pip install -e .` the plugin directory separately, conflicting with FiftyOne's directory-based plugin management.
-
-The chosen approach:
-- `requirements.txt` covers online mode (the common case) — lightweight, no GPU deps
-- Offline mode requires manual `pip install 'vllm>=0.16.0'`
-- The operator UI surfaces a clear error with the exact install command when offline mode is selected and vllm is missing or outdated (see `_mode_selector()` in Section 7.1)
-- The engine performs a version floor check at import time:
-
-```python
-def _import_vllm():
-    try:
-        import vllm
-        from packaging.version import Version
-        if Version(vllm.__version__) < Version("0.16.0"):
-            raise ImportError(
-                f"vllm>=0.16.0 required, found {vllm.__version__}. "
-                f"Upgrade with: pip install 'vllm>=0.16.0'"
-            )
-        return vllm
-    except ImportError:
-        raise ImportError(
-            "Offline mode requires vllm>=0.16.0. "
-            "Install with: pip install 'vllm>=0.16.0'"
-        )
-```
-
-If FiftyOne's plugin system adds extras support in the future, a `pyproject.toml` with `[local]` extra group can be trivially added.
+No GPU/CUDA dependencies — all inference runs on the vLLM server.
 
 ---
 
-## 12. Future Considerations (Post-MVP)
+## 12. Future Considerations
 
 | Feature | How Architecture Supports It |
 |---------|------------------------------|
+| **Offline mode (in-process GPU)** | Add `mode` param to VLLMEngine, `_offline_batch()`, `cleanup()`. See extension points below |
 | **Structured JSON extraction** | Add `"json_extract"` task to TaskConfig with user-provided schema → `structured_outputs(json=)` |
 | **Multi-image per sample** | Extend `build_messages()` to accept multiple images per sample |
 | **Video understanding** | Add video frame extraction to utils; some VLMs support video inputs |
@@ -1746,10 +1422,20 @@ If FiftyOne's plugin system adds extras support in the future, a `pyproject.toml
 | **Segmentation polygons** | Add `"segment"` task → `fo.Polylines` |
 | **Model auto-discovery** | Query `/v1/models` endpoint to populate model dropdown dynamically |
 
+### Extension Points for Future Offline Mode
+
+Adding offline mode (in-process GPU via `vllm.LLM`) requires changes to 3 of the 4 source files:
+
+1. **engine.py**: Add `mode` parameter to `__init__()`. Add offline-only params (`tensor_parallel_size`, `gpu_memory_utilization`, `max_model_len`, `dtype`, `trust_remote_code`, `enforce_eager`, `limit_mm_per_prompt`, `device`, `chat_template`). Add `_offline_batch()` using `LLM.chat()` with `SamplingParams(structured_outputs=StructuredOutputsParams(...))`. Add `cleanup()` for GPU memory freeing (`del self._llm` + `torch.cuda.empty_cache()`). Dispatch in `infer_batch()` based on mode.
+2. **utils.py**: Add `mode` parameter to `build_image_contents()`. Add `pil` image mode using `PIL.Image.open()` (lazy-loaded; vLLM decodes pixels internally). Update `_resolve_image_mode()` to default to `pil` for offline mode and override `filepath→pil` since `file://` is not supported by `LLM.chat()`.
+3. **operators.py**: Add `_mode_selector()` RadioGroup for online/offline. Make server settings conditional on online mode. Add offline engine settings (`tensor_parallel_size`, `gpu_memory_utilization`, `max_model_len`, chat template, `_device_selector()`). Add `try/finally` with `engine.cleanup()` in `execute()`. Add vllm version check in UI.
+4. **tasks.py**: No changes needed — task prompts, schemas, and parsers are mode-agnostic.
+5. Add `requirements-local.txt` with `vllm>=0.16.0` for users who want offline mode.
+
 ### Architectural hooks
 
 1. **TaskConfig is extensible**: New tasks add an entry to `TASKS`, a `get_structured_outputs()` branch, and a `parse_response()` branch. Engine and operator are untouched.
-2. **VLLMEngine is mode-agnostic**: New vLLM features (LoRA, speculative decoding, quantization) only touch `engine.py`.
+2. **VLLMEngine is API-agnostic**: New vLLM features (LoRA, speculative decoding, quantization) only touch `engine.py`.
 3. **Operator UI is dynamic**: New parameters only require changes to the relevant helper function in `operators.py`.
 
 ---
@@ -1758,9 +1444,7 @@ If FiftyOne's plugin system adds extras support in the future, a `pyproject.toml
 
 | Risk | Mitigation |
 |------|-----------|
-| vLLM not installed (offline mode) | Lazy import with version floor check (≥0.16.0); UI shows error with install command before form completion; online mode works without vllm. Core `requirements.txt` omits vllm; `requirements-local.txt` provided for convenience |
-| Server unreachable (online mode) | `validate_connection()` before batch processing; query `/v1/models` |
-| Model OOM (offline mode) | Expose `gpu_memory_utilization`, `max_model_len`, device selection. Note: vLLM crashes at init if model can't fit — user must adjust settings |
+| Server unreachable | `validate_connection()` before batch processing; query `/v1/models` |
 | Slow base64 encoding | ThreadPool parallelism with configurable `max_workers` |
 | `max_tokens` too low for JSON output | Affects all tasks (all use JSON schemas). Minimum recommended: 32 for classify, 64 for caption/vqa/ocr, 128 for tag, 256 for detect. Validate in resolve_input |
 | Structured output fails for a sample | No fallback to free-text parsing. Sample errors into `{field}_error` field. Silent degradation would produce unparseable data that violates the contract |
@@ -1770,6 +1454,5 @@ If FiftyOne's plugin system adds extras support in the future, a `pyproject.toml
 | Individual sample parse failure | Per-sample try/except; errors stored in `{field}_error` field |
 | Event loop already running (FiftyOne App) | `_run_async()` detects existing loop, runs async code in dedicated thread |
 | Output field type conflict | `_field_conflict_check()` warns in UI before execution |
-| `file://` in offline mode | Use `image_pil` (PIL objects); `_resolve_image_mode()` overrides filepath→pil for offline |
 | Dataset too large for memory | Stream IDs/filepaths with batch iteration; never load all samples at once |
-| Model lacks chat template (LLaVA-1.5) | `chat_template` advanced setting accepts raw string or file path |
+| Model lacks chat template | Configure on vLLM server via `vllm serve --chat-template <path>` |

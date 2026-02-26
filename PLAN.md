@@ -1,4 +1,4 @@
-# fo-vllm: FiftyOne + vLLM Plugin Integration Plan
+# fo-vllm: FiftyOne + vLLM Plugin — Refined Implementation Plan
 
 ## 1. Executive Summary
 
@@ -6,10 +6,10 @@ This plugin integrates vLLM with FiftyOne to provide universal VLM inference ove
 
 **Key principles**:
 
-1. **Structured output only**: All non-text outputs use vLLM's constrained generation (`StructuredOutputsParams` with `choice` or `json`). Text parsing and fuzzy matching are never used.
-2. **vLLM handles chat templates**: The plugin always sends OpenAI-format messages. vLLM automatically applies the correct chat template per model.
-3. **Operates on FiftyOne datasets directly**: The operator works on `ctx.target_view()` (dataset, view, or selected samples) and writes results via `set_values()`.
-4. **Parallel everything**: ThreadPool for image encoding, async for online API calls, native batching for offline mode.
+1. **All tasks use structured output — no exceptions**: Every VLM response is constrained by `StructuredOutputsParams`. Tasks producing FiftyOne labels use `json=` schemas; classification uses `choice=`. Tasks producing text (caption, VQA, OCR, custom) also use `json=` schemas wrapping the text in a named key (e.g., `{"text": "..."}`). There is zero free-text parsing anywhere in the plugin. Post-generation validation catches what token-level constraints cannot enforce (numeric ranges, cross-field relationships).
+2. **vLLM handles chat templates**: The plugin always sends OpenAI-format messages. vLLM automatically applies the correct chat template per model. Users may supply a custom chat template (as a raw string or file path) for models that lack one.
+3. **Operates on FiftyOne datasets directly**: The single operator works on `ctx.target_view()` (dataset, view, or selected samples) and writes results via `set_values()`.
+4. **Parallel everything**: ThreadPool for image loading/encoding, async HTTP for online API calls, native batching for offline mode. Concurrency limits are user-configurable.
 
 **Core value**: One plugin, any VLM, any task, any scale.
 
@@ -25,9 +25,9 @@ The operator directly manages iteration over samples and calls vLLM.
 
 | Aspect | Assessment |
 |--------|-----------|
-| Simplicity | High -- minimal abstraction |
-| Reusability | Low -- logic locked inside operator |
-| Parallelism | Manual -- must implement threading |
+| Simplicity | High — minimal abstraction |
+| Reusability | Low — logic locked inside operator |
+| Parallelism | Manual — must implement threading |
 
 **Verdict**: Too monolithic. Mixing inference engine logic with FiftyOne operator logic hurts testability and reuse.
 
@@ -37,12 +37,12 @@ Implement FiftyOne's `Model` class and use `view.apply_model()`.
 
 | Aspect | Assessment |
 |--------|-----------|
-| FiftyOne integration | Deep -- works with apply_model, Model Zoo |
-| Image handling | Wasteful -- numpy decode/re-encode overhead |
-| Prompt support | Awkward -- Model interface has no prompt concept |
-| Batch efficiency | Moderate -- predict_all helps but images arrive as numpy |
+| FiftyOne integration | Deep — works with apply_model, Model Zoo |
+| Image handling | Wasteful — numpy decode/re-encode overhead |
+| Prompt support | Awkward — Model interface has no prompt concept |
+| Batch efficiency | Moderate — predict_all helps but images arrive as numpy |
 
-**Verdict**: The `fo.Model` interface was designed for traditional vision models (input: tensor, output: label). VLMs need prompts, structured output constraints, and work best with file paths or base64 -- not numpy arrays.
+**Verdict**: The `fo.Model` interface was designed for traditional vision models (input: tensor, output: label). VLMs need prompts, structured output constraints, and work best with file paths, PIL images, or base64 — not numpy arrays.
 
 ### Design C: Hybrid Engine + Smart Operator (CHOSEN)
 
@@ -50,10 +50,10 @@ Separate `VLLMEngine` for inference, `TaskConfig` for prompts/structured output/
 
 | Aspect | Assessment |
 |--------|-----------|
-| Image handling | Optimal -- file:// paths or parallel base64, no numpy |
-| Batch efficiency | High -- native vLLM batching, bulk set_values() writes |
+| Image handling | Optimal — PIL objects (offline) or base64/file paths (online), no numpy |
+| Batch efficiency | High — native vLLM batching, bulk set_values() writes |
 | Structured output | Full vLLM constrained generation (StructuredOutputsParams) |
-| Separation of concerns | Clean -- engine, task config, and operator each have one job |
+| Separation of concerns | Clean — engine, task config, and operator each have one job |
 
 ### Cherry-Picked Elements
 
@@ -62,8 +62,8 @@ Separate `VLLMEngine` for inference, `TaskConfig` for prompts/structured output/
 | Design A | Direct control over batch loop | Avoids apply_model overhead for VLMs |
 | Design B | Reusable class external to operator | Engine can be used via SDK |
 | Design C | Parallel image prep + bulk writes | Maximum throughput |
-| Design C | File path-based image handling | Zero unnecessary image decoding |
-| vLLM | `StructuredOutputsParams(choice=..., json=...)` | Enforced structured output, zero text parsing |
+| Design C | Mode-aware image handling | PIL for offline (zero-copy lazy loading), base64/filepath for online |
+| vLLM | `StructuredOutputsParams(choice=..., json=...)` | Enforced structured output at the token level |
 
 ---
 
@@ -84,13 +84,14 @@ Separate `VLLMEngine` for inference, `TaskConfig` for prompts/structured output/
  |               | prompt build |                           |
  |               | JSON schemas |                           |
  |               | output parse |                           |
+ |               | + validation |                           |
  |               +------+-------+                           |
  |                      |                                   |
  |               +------v-------+                           |
  |               |  VLLMEngine  |                           |
  |               |              |                           |
  |               | +----------+ |                           |
- |               | |  Online  | | OpenAI-compat async HTTP  |
+ |               | |  Online  | | AsyncOpenAI + semaphore    |
  |               | +----------+ |                           |
  |               | +----------+ |                           |
  |               | | Offline  | | vllm.LLM.chat() batch     |
@@ -99,48 +100,73 @@ Separate `VLLMEngine` for inference, `TaskConfig` for prompts/structured output/
  +---------------------------------------------------------+
 ```
 
+### Image flow by mode
+
+```
+Online (remote server):   filepath → ThreadPool base64 encode → image_url content → HTTP
+Online (local server):    filepath → file:// URL string (no I/O) → image_url content → HTTP
+Offline (in-process GPU): filepath → ThreadPool PIL.Image.open() → image_pil content → LLM.chat()
+```
+
+The offline path uses PIL Image objects via vLLM's `image_pil` content type extension. `PIL.Image.open()` is lazy — it reads the file header but defers pixel decoding to vLLM's internal processor. This is the true zero-copy-from-disk path. The `file://` scheme is only supported by the vLLM HTTP server (with `--allowed-local-media-path`), **not** by the offline `LLM.chat()` API.
+
 ---
 
 ## 4. File Structure
 
 ```
 fo-vllm/
-  fiftyone.yml          # Plugin manifest
-  __init__.py           # register(plugin), operator imports
-  engine.py             # VLLMEngine: online/offline inference + structured output
-  tasks.py              # TaskConfig: prompts, JSON schemas, output parsers
-  operators.py          # FiftyOne operator: UI, batching, progress, result storage
-  utils.py              # Image encoding, async helpers
-  requirements.txt      # openai, vllm (optional), pillow
+  fiftyone.yml              # Plugin manifest
+  __init__.py               # register(plugin), operator imports
+  engine.py                 # VLLMEngine: online/offline inference + structured output
+  tasks.py                  # TaskConfig: prompts, JSON schemas, output parsers + validation
+  operators.py              # FiftyOne operator: UI, batching, progress, result storage
+  utils.py                  # Image loading/encoding, async helpers
+  requirements.txt          # Core deps (openai, pillow) — installed by FiftyOne plugin system
+  requirements-local.txt    # Core + offline deps (adds vllm) — for manual/CI install
 ```
 
 ---
 
 ## 5. Task Taxonomy
 
-The plugin supports 7 task types, selectable via a dropdown in the FiftyOne App. Each task defines three things: a **prompt template**, a **structured output constraint**, and an **output parser**.
+The plugin supports 7 task types, selectable via a dropdown in the FiftyOne App. Each task defines three things: a **prompt template**, a **structured output constraint**, and an **output parser** (with post-generation validation where applicable).
 
 ### 5.1 Task Overview
 
-| Task | Description | vLLM Constraint | FiftyOne Output Type |
-|------|-------------|-----------------|---------------------|
-| **Caption** | Generate image description | None (free text) | `StringField` |
-| **Classify** | Single-label classification | `structured_outputs(choice=)` | `fo.Classification` |
-| **Tag** | Multi-label tagging | `structured_outputs(json=)` | `fo.Classifications` |
-| **Detect** | Object detection with bboxes | `structured_outputs(json=)` | `fo.Detections` |
-| **VQA** | Visual question answering | None (free text) | `StringField` |
-| **OCR** | Extract text from image | None (free text) | `StringField` |
-| **Custom** | User-defined prompt | None (free text) | `StringField` |
+| Task | Description | vLLM Constraint | Schema Key | FiftyOne Output Type | Parse Path |
+|------|-------------|-----------------|------------|---------------------|------------|
+| **Caption** | Generate image description | `json=` | `text` | `StringField` | `json.loads(r)["text"]` |
+| **Classify** | Single-label classification | `choice=` | — | `fo.Classification` | `r.strip()` → label |
+| **Tag** | Multi-label tagging | `json=` | `labels` | `fo.Classifications` | `json.loads(r)["labels"]` |
+| **Detect** | Object detection with bboxes | `json=` | `detections` | `fo.Detections` | `json.loads(r)["detections"]` → validate |
+| **VQA** | Visual question answering | `json=` | `answer` | `StringField` | `json.loads(r)["answer"]` |
+| **OCR** | Extract text from image | `json=` | `text` | `StringField` | `json.loads(r)["text"]` |
+| **Custom** | User-defined prompt | `json=` | `response` | `StringField` | `json.loads(r)["response"]` |
+
+Every task uses structured output. Every parse path is `json.loads()` on schema-enforced JSON (or `.strip()` on a `choice=`-enforced string). There is no text parsing, no regex extraction, no fuzzy matching, no heuristic cleanup, anywhere in the plugin.
 
 ### 5.2 Per-Task Specifications
 
 #### Caption
 
 - **Default prompt**: `"Describe this image concisely."`
-- **System prompt**: None
-- **Structured output**: None
-- **Output parse**: Store raw text as `StringField`
-- **Additional inputs**: None (prompt override available)
+- **System prompt**: `"You are an image captioner. Respond with a JSON object: {\"text\": \"your description\"}"`
+- **Structured output**: `StructuredOutputsParams(json=schema)` with schema:
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "text": {"type": "string"}
+  },
+  "required": ["text"],
+  "additionalProperties": false
+}
+```
+
+- **Output parse**: `json.loads(text)["text"]` → `StringField`
+- **Default output field**: `caption`
 
 #### Classify
 
@@ -149,11 +175,12 @@ The plugin supports 7 task types, selectable via a dropdown in the FiftyOne App.
 - **Structured output**: `StructuredOutputsParams(choice=classes)` — forces output to be exactly one of the class names
 - **Output parse**: `fo.Classification(label=output_text.strip())`
 - **Additional inputs**: `classes` (required, comma-separated list)
+- **Default output field**: `classification`
 
 #### Tag
 
 - **Default prompt**: `"Tag this image with all applicable labels from: {classes}"`
-- **System prompt**: `"You are an image tagger. Return a JSON object with a 'labels' array containing all applicable tags."`
+- **System prompt**: `"You are an image tagger. Respond with a JSON object: {\"labels\": [\"tag1\", \"tag2\", ...]}"`
 - **Structured output**: `StructuredOutputsParams(json=schema)` with schema:
 
 ```json
@@ -165,17 +192,20 @@ The plugin supports 7 task types, selectable via a dropdown in the FiftyOne App.
       "items": {"type": "string", "enum": ["<class1>", "<class2>", "..."]}
     }
   },
-  "required": ["labels"]
+  "required": ["labels"],
+  "additionalProperties": false
 }
 ```
 
 - **Output parse**: `json.loads(text)["labels"]` → `fo.Classifications(classifications=[fo.Classification(label=l) for l in labels])`
 - **Additional inputs**: `classes` (required, comma-separated list)
+- **Default output field**: `tags`
 
 #### Detect
 
-- **Default prompt**: `"Detect all objects in this image. For each object, return its label and bounding box as [x_min, y_min, x_max, y_max] in 0-1000 coordinates."` (If classes provided: `"Detect these objects: {classes}..."`)
-- **System prompt**: `"You are an object detector. Return a JSON object with a 'detections' array. Each detection has a 'label' string and 'box' array of [x_min, y_min, x_max, y_max] in 0-1000 coordinate space."`
+- **Default prompt**: `"Detect all objects in this image. For each object, return its label and bounding box as [x_min, y_min, x_max, y_max] in 0-1000 normalized coordinates."`
+  (If classes provided: `"Detect these objects in this image: {classes}. ..."`)
+- **System prompt**: `"You are an object detector. Respond with a JSON object: {\"detections\": [{\"label\": \"...\", \"box\": [x_min, y_min, x_max, y_max]}, ...]}. Use 0-1000 normalized coordinates where 0 is top-left and 1000 is bottom-right."`
 - **Structured output**: `StructuredOutputsParams(json=schema)` with schema:
 
 ```json
@@ -195,55 +225,129 @@ The plugin supports 7 task types, selectable via a dropdown in the FiftyOne App.
             "maxItems": 4
           }
         },
-        "required": ["label", "box"]
+        "required": ["label", "box"],
+        "additionalProperties": false
       }
     }
   },
-  "required": ["detections"]
+  "required": ["detections"],
+  "additionalProperties": false
 }
 ```
 
 (When classes are provided, the `label` field adds `"enum": ["<class1>", ...]`)
 
-- **Output parse**: `json.loads(text)["detections"]` → convert each `[x1, y1, x2, y2]` from 0-1000 to FiftyOne's `[x, y, w, h]` relative format (divide by 1000, convert xyxy→xywh) → `fo.Detections(detections=[fo.Detection(label=d["label"], bounding_box=[x, y, w, h]) for d in dets])`
-- **Additional inputs**: `classes` (optional, comma-separated)
-- **Caveat**: Coordinate accuracy depends on model capability. Works best with Qwen2.5-VL which natively supports grounding.
+- **Output parse**: JSON parse → **post-generation validation** (clamp coordinates to [0, 1000], reject degenerate boxes where x2 ≤ x1 or y2 ≤ y1, verify 4-element arrays) → convert `[x1, y1, x2, y2]` from 0-1000 to FiftyOne's `[x, y, w, h]` relative format → `fo.Detections`
+- **Additional inputs**: `classes` (optional), `coordinate_format` (advanced, default `normalized_1000`)
+- **Default output field**: `detections`
+
+**Coordinate format note**: The 0-1000 normalized convention matches the Qwen2-VL/Qwen2.5-VL/Qwen3-VL model family's native grounding format. Other VLMs may use different coordinate systems. The `coordinate_format` advanced setting supports:
+
+| Format | Range | Models | Conversion |
+|--------|-------|--------|-----------|
+| `normalized_1000` | 0–1000 | Qwen2-VL, Qwen2.5-VL, Qwen3-VL | ÷ 1000 |
+| `normalized_1` | 0.0–1.0 | Some fine-tuned models | Direct use |
+| `pixel` | 0–image_dim | InternVL, others | Requires `sample.metadata` |
+
+Detection is inherently less "universal" than classification/captioning — accuracy and coordinate format depend heavily on the specific VLM's grounding capabilities.
+
+**Schema backend note**: `minItems`/`maxItems` constraints are ignored by the default xgrammar backend. When vLLM's `auto` backend selector routes to guidance or outlines, they are enforced. The post-parse validation step handles the case when they are not.
 
 #### VQA
 
 - **Default prompt**: `"{question}"`
-- **System prompt**: None
-- **Structured output**: None (free text)
-- **Output parse**: Store raw text as `StringField`
+- **System prompt**: `"You are a visual question answerer. Respond with a JSON object: {\"answer\": \"your answer\"}"`
+- **Structured output**: `StructuredOutputsParams(json=schema)` with schema:
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "answer": {"type": "string"}
+  },
+  "required": ["answer"],
+  "additionalProperties": false
+}
+```
+
+- **Output parse**: `json.loads(text)["answer"]` → `StringField`
 - **Additional inputs**: `question` (required)
+- **Default output field**: `vqa_answer`
 
 #### OCR
 
-- **Default prompt**: `"Extract all text visible in this image. Return only the extracted text, nothing else."`
-- **System prompt**: None
-- **Structured output**: None
-- **Output parse**: Store raw text as `StringField`
-- **Additional inputs**: None (prompt override available)
+- **Default prompt**: `"Extract all text visible in this image."`
+- **System prompt**: `"You are an OCR engine. Respond with a JSON object: {\"text\": \"extracted text\"}"`
+- **Structured output**: `StructuredOutputsParams(json=schema)` with schema:
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "text": {"type": "string"}
+  },
+  "required": ["text"],
+  "additionalProperties": false
+}
+```
+
+- **Output parse**: `json.loads(text)["text"]` → `StringField`
+- **Default output field**: `ocr_text`
 
 #### Custom
 
 - **Default prompt**: User-provided (required)
-- **System prompt**: User-provided (optional)
-- **Structured output**: None
-- **Output parse**: Store raw text as `StringField`
-- **Additional inputs**: `prompt` (required), `system_prompt` (optional)
+- **System prompt**: `"Respond with a JSON object: {\"response\": \"your response\"}"` (user-overridable)
+- **Structured output**: `StructuredOutputsParams(json=schema)` with schema:
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "response": {"type": "string"}
+  },
+  "required": ["response"],
+  "additionalProperties": false
+}
+```
+
+- **Output parse**: `json.loads(text)["response"]` → `StringField`
+- **Default output field**: `vlm_output`
 
 ### 5.3 Structured Output Strategy
 
-**Core principle**: The plugin never parses free-form text to extract labels. Instead:
+**Policy: All tasks use structured output. No exceptions.** Every VLM response is constrained by a JSON schema via `StructuredOutputsParams(json=...)`. The `choice=` constraint for classification is the sole non-JSON structured output type, retained because it is more efficient than a JSON wrapper for single-label selection and is itself a structured output mechanism.
 
-| Output type | Mechanism | Guarantee |
-|-------------|-----------|-----------|
-| Single label from fixed set | `structured_outputs(choice=)` | Output is exactly one of the allowed strings |
-| JSON object/array | `structured_outputs(json=)` | Output is valid JSON conforming to the schema |
-| Free text (captions, VQA, OCR) | No constraint | Stored as-is, no parsing needed |
+This means:
+- Every response from vLLM is either a valid JSON string (parseable via `json.loads()`) or a single token from a choice list
+- There is zero text parsing anywhere in the plugin
+- Every task has an explicit, declared schema
+- Adding metadata fields to any task later (confidence, reasoning, etc.) is a schema change, not a parser change
 
-The only "parsing" performed is `json.loads()` on JSON that has been schema-enforced by vLLM's constrained generation. This is deterministic and cannot fail (barring truncation from insufficient `max_tokens`).
+**What structured output enforces** (reliably, across all backends):
+
+| Constraint type | Mechanism | Example |
+|----------------|-----------|---------|
+| Single label from fixed set | `choice=` | Output is exactly `"cat"` or `"dog"` |
+| JSON structure (keys, types, nesting) | `json=` schema | Output has `{"detections": [...]}` |
+| String values from enum | `enum` in schema | Labels constrained to predefined classes |
+| No extraneous fields | `additionalProperties: false` | Only declared keys appear in output |
+
+**What structured output cannot enforce** (no backend supports at token level):
+
+| Constraint type | Why not | Mitigation |
+|----------------|---------|-----------|
+| Numeric ranges (0 ≤ x ≤ 1000) | Regex/grammar can't encode value semantics | Post-parse clamping |
+| Cross-field relationships (x2 > x1) | JSON Schema has no cross-field syntax | Post-parse rejection of degenerate boxes |
+| Array length (`minItems`/`maxItems`) | xgrammar ignores; outlines/guidance support | Post-parse length validation |
+
+**No fallback to free-text parsing.** If structured output fails for a sample (backend error, truncation, etc.), that sample errors into a `{field}_error` field. Silent degradation to unstructured output is not permitted — it would produce data that violates the parsing contract, which is worse than a visible error.
+
+**Performance implications**: For string-output tasks (caption, VQA, OCR, custom), the JSON wrapper adds ~5-8 tokens of overhead per response (`{"text": "` prefix + `"}` suffix). Content quality inside the string value is unaffected. The guidance backend can actually *speed up* generation via jump-forward decoding on the deterministic structural tokens. For a 512-token response, the overhead is ~1.5%.
+
+**System prompt hints**: Every task's system prompt includes the expected JSON structure. vLLM's documentation confirms best practice: "normally it's better to indicate in the prompt that a JSON needs to be generated and which fields and how should the LLM fill them. This can improve the results notably in most cases." The schema *enforces* structure regardless, but the prompt hint improves content quality.
+
+**`additionalProperties: false`**: Every schema includes this. It prevents the model from adding unexpected fields, reduces wasted tokens, and ensures `json.loads()` results can be indexed directly without defensive checks.
 
 **Engine mapping** (vLLM 0.16+ `StructuredOutputsParams` API):
 
@@ -278,85 +382,190 @@ class VLLMEngine:
         trust_remote_code: bool = True,
         enforce_eager: bool = False,
         limit_mm_per_prompt: dict | None = None,
+        chat_template: str | None = None,       # Raw Jinja2 string or file path
+        device: str | None = None,              # e.g., "cuda:0", "cuda:0,1", "auto"
         # Sampling parameters (both modes)
         temperature: float = 0.0,
         max_tokens: int = 512,
         top_p: float = 1.0,
         seed: int | None = None,
-    ): ...
+    ):
+        self.model = model
+        self.mode = mode
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.top_p = top_p
+        self.seed = seed
+        self._max_concurrent = max_concurrent
+        self._chat_template = self._resolve_chat_template(chat_template)
+
+        if mode == "online":
+            from openai import AsyncOpenAI
+            self._aclient = AsyncOpenAI(
+                base_url=base_url, api_key=api_key
+            )
+            self._llm = None
+        elif mode == "offline":
+            try:
+                from vllm import LLM
+            except ImportError:
+                raise ImportError(
+                    "vllm>=0.16.0 is required for offline mode. "
+                    "Install with: pip install 'vllm>=0.16.0'"
+                )
+            # Set CUDA_VISIBLE_DEVICES if device specified
+            if device and device != "auto":
+                import os
+                os.environ["CUDA_VISIBLE_DEVICES"] = device.replace("cuda:", "")
+
+            self._llm = LLM(
+                model=model,
+                tensor_parallel_size=tensor_parallel_size,
+                gpu_memory_utilization=gpu_memory_utilization,
+                max_model_len=max_model_len,
+                dtype=dtype,
+                trust_remote_code=trust_remote_code,
+                enforce_eager=enforce_eager,
+                limit_mm_per_prompt=limit_mm_per_prompt or {"image": 1},
+            )
+            self._aclient = None
+
+    @staticmethod
+    def _resolve_chat_template(chat_template: str | None) -> str | None:
+        """Resolve chat template from raw string or file path."""
+        if chat_template is None:
+            return None
+        # If it looks like a file path and exists, read it
+        import os
+        if os.path.isfile(chat_template):
+            with open(chat_template, "r") as f:
+                return f.read()
+        # Otherwise treat as raw Jinja2 string
+        return chat_template
+
+    def list_models(self) -> list[str]:
+        """Query available models (online mode only)."""
+        if self.mode != "online":
+            return [self.model]
+        from openai import OpenAI
+        sync_client = OpenAI(
+            base_url=self._aclient.base_url, api_key=self._aclient.api_key
+        )
+        return [m.id for m in sync_client.models.list().data]
+
+    def validate_connection(self):
+        """Test server connectivity (online mode). Raises on failure."""
+        if self.mode != "online":
+            return
+        models = self.list_models()
+        if not models:
+            raise ConnectionError("vLLM server returned no models")
 
     def infer_batch(
         self,
         messages: list[list[dict]],
-        structured_outputs: dict | None = None,
+        structured_outputs: dict,
     ) -> list[str]:
-        """Run batch inference with optional structured output constraints.
+        """Run batch inference with structured output constraints.
 
         Args:
             messages: list of OpenAI-format message lists, one per sample.
-            structured_outputs: optional dict passed to vLLM's
-                StructuredOutputsParams. Examples:
+            structured_outputs: dict passed to vLLM's StructuredOutputsParams.
+                Every task provides this — it is never None. Examples:
                   {"choice": ["cat", "dog"]}
                   {"json": {<JSON schema>}}
-                Pass None for free-text tasks.
 
-        Returns list of response strings (plain text or valid JSON).
+        Returns list of response strings (valid JSON or choice-constrained string).
         """
         if self.mode == "online":
             return self._online_batch(messages, structured_outputs)
         return self._offline_batch(messages, structured_outputs)
 
     def _online_batch(self, messages, structured_outputs) -> list[str]:
-        """Async concurrent OpenAI API calls with semaphore for backpressure."""
-        # Build extra_body from structured output params
-        # extra_body = {}
-        # if structured_outputs:
-        #     extra_body["structured_outputs"] = structured_outputs
-        #
-        # sem = asyncio.Semaphore(self._max_concurrent)
-        # async def _call(msgs):
-        #     async with sem:
-        #         resp = await self._client.chat.completions.create(
-        #             model=self.model, messages=msgs,
-        #             temperature=self.temperature, max_tokens=self.max_tokens,
-        #             top_p=self.top_p, seed=self.seed,
-        #             extra_body=extra_body or None,
-        #         )
-        #         return resp.choices[0].message.content
-        # return asyncio.run(asyncio.gather(*[_call(m) for m in messages]))
-        ...
+        """Async concurrent OpenAI API calls with event-loop-safe execution."""
+        return _run_async(self._async_online_batch(messages, structured_outputs))
+
+    async def _async_online_batch(self, messages, structured_outputs) -> list[str]:
+        extra_body = {"structured_outputs": structured_outputs}
+
+        sem = asyncio.Semaphore(self._max_concurrent)
+
+        async def _call(msgs):
+            async with sem:
+                resp = await self._aclient.chat.completions.create(
+                    model=self.model,
+                    messages=msgs,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    top_p=self.top_p,
+                    seed=self.seed,
+                    extra_body=extra_body,
+                )
+                return resp.choices[0].message.content
+
+        return list(await asyncio.gather(*[_call(m) for m in messages]))
 
     def _offline_batch(self, messages, structured_outputs) -> list[str]:
         """vLLM LLM.chat() native batch inference with structured output."""
-        # from vllm import SamplingParams
-        # from vllm.sampling_params import StructuredOutputsParams
-        #
-        # so_params = None
-        # if structured_outputs:
-        #     so_params = StructuredOutputsParams(**structured_outputs)
-        #
-        # params = SamplingParams(
-        #     temperature=self.temperature, max_tokens=self.max_tokens,
-        #     top_p=self.top_p, seed=self.seed,
-        #     structured_outputs=so_params,
-        # )
-        # outputs = self._llm.chat(messages, sampling_params=params)
-        # return [o.outputs[0].text for o in outputs]
-        ...
+        from vllm import SamplingParams
+        from vllm.sampling_params import StructuredOutputsParams
+
+        so_params = StructuredOutputsParams(**structured_outputs)
+
+        params = SamplingParams(
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            top_p=self.top_p,
+            seed=self.seed,
+            structured_outputs=so_params,
+        )
+
+        chat_kwargs = {}
+        if self._chat_template:
+            chat_kwargs["chat_template"] = self._chat_template
+
+        outputs = self._llm.chat(messages, sampling_params=params, **chat_kwargs)
+        return [o.outputs[0].text for o in outputs]
 
     def cleanup(self):
         """Free GPU memory (offline mode)."""
         if hasattr(self, "_llm") and self._llm is not None:
             del self._llm
             self._llm = None
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except ImportError:
+                pass
+
+
+import asyncio
+
+def _run_async(coro):
+    """Run an async coroutine safely, handling existing event loops.
+
+    FiftyOne's App runs a Uvicorn server with its own event loop.
+    Calling asyncio.run() from within that context raises
+    RuntimeError: 'This event loop is already running'.
+    This helper detects that case and runs in a dedicated thread.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(asyncio.run, coro).result()
+    else:
+        return asyncio.run(coro)
 ```
 
 ### 6.2 `TaskConfig` (`tasks.py`)
 
-Handles prompt construction, structured output schema generation, and deterministic output parsing per task type.
+Handles prompt construction, structured output schema generation, and deterministic output parsing per task type — including post-generation validation for detection.
 
 ```python
 import json
@@ -368,50 +577,57 @@ class TaskConfig:
 
     TASKS = {
         "caption": {
-            "system": None,
+            "system": "You are an image captioner. Respond with a JSON object: {\"text\": \"your description\"}",
             "prompt": "Describe this image concisely.",
-            "output_type": "string",     # FiftyOne field type
+            "output_type": "string",
+            "default_field": "caption",
+            "default_temperature": 0.2,
         },
         "classify": {
             "system": "You are an image classifier. Respond with exactly one class label.",
             "prompt": "Classify this image. Choose exactly one: {classes}",
             "output_type": "Classification",
+            "default_field": "classification",
+            "default_temperature": 0.0,
         },
         "tag": {
-            "system": (
-                "You are an image tagger. Return a JSON object with a "
-                "'labels' array containing all applicable tags."
-            ),
+            "system": "You are an image tagger. Respond with a JSON object: {\"labels\": [\"tag1\", \"tag2\", ...]}",
             "prompt": "Tag this image with all applicable labels from: {classes}",
             "output_type": "Classifications",
+            "default_field": "tags",
+            "default_temperature": 0.0,
         },
         "detect": {
             "system": (
-                "You are an object detector. Return a JSON object with a "
-                "'detections' array. Each detection has a 'label' string "
-                "and 'box' array of [x_min, y_min, x_max, y_max] in "
-                "0-1000 coordinate space."
+                "You are an object detector. Respond with a JSON object: "
+                "{\"detections\": [{\"label\": \"...\", \"box\": [x_min, y_min, x_max, y_max]}, ...]}. "
+                "Use 0-1000 normalized coordinates where 0 is top-left and 1000 is bottom-right."
             ),
             "prompt": "Detect all objects in this image.",
             "output_type": "Detections",
+            "default_field": "detections",
+            "default_temperature": 0.0,
         },
         "vqa": {
-            "system": None,
+            "system": "You are a visual question answerer. Respond with a JSON object: {\"answer\": \"your answer\"}",
             "prompt": "{question}",
             "output_type": "string",
+            "default_field": "vqa_answer",
+            "default_temperature": 0.2,
         },
         "ocr": {
-            "system": None,
-            "prompt": (
-                "Extract all text visible in this image. "
-                "Return only the extracted text, nothing else."
-            ),
+            "system": "You are an OCR engine. Respond with a JSON object: {\"text\": \"extracted text\"}",
+            "prompt": "Extract all text visible in this image.",
             "output_type": "string",
+            "default_field": "ocr_text",
+            "default_temperature": 0.0,
         },
         "custom": {
-            "system": None,
+            "system": "Respond with a JSON object: {\"response\": \"your response\"}",
             "prompt": "{prompt}",
             "output_type": "string",
+            "default_field": "vlm_output",
+            "default_temperature": 0.2,
         },
     }
 
@@ -421,12 +637,19 @@ class TaskConfig:
         prompt: str | None = None,
         system_prompt: str | None = None,
         classes: list[str] | None = None,
+        coordinate_format: str = "normalized_1000",
         **template_kwargs,
     ):
+        if task not in self.TASKS:
+            raise ValueError(f"Unknown task: {task}. Must be one of {list(self.TASKS)}")
+
         defaults = self.TASKS[task]
         self.task = task
         self.classes = classes
         self.output_type = defaults["output_type"]
+        self.default_field = defaults["default_field"]
+        self.default_temperature = defaults["default_temperature"]
+        self.coordinate_format = coordinate_format
         self.system_prompt = system_prompt if system_prompt is not None else defaults["system"]
 
         # Build the user prompt from template
@@ -437,7 +660,11 @@ class TaskConfig:
         self.prompt = raw_prompt.format(**fmt_kwargs) if fmt_kwargs else raw_prompt
 
     def build_messages(self, image_content: dict) -> list[dict]:
-        """Build OpenAI-format messages for one image."""
+        """Build OpenAI-format messages for one image.
+
+        Works with both online mode (image_url content) and
+        offline mode (image_pil content via vLLM extension).
+        """
         messages = []
         if self.system_prompt:
             messages.append({"role": "system", "content": self.system_prompt})
@@ -449,8 +676,18 @@ class TaskConfig:
 
     # -- Structured output constraints (vLLM 0.16+ StructuredOutputsParams) --
 
-    def get_structured_outputs(self) -> dict | None:
-        """Return kwargs dict for StructuredOutputsParams, or None.
+    # Map of task → JSON key for string-output tasks
+    _STRING_KEYS = {
+        "caption": "text",
+        "vqa": "answer",
+        "ocr": "text",
+        "custom": "response",
+    }
+
+    def get_structured_outputs(self) -> dict:
+        """Return kwargs dict for StructuredOutputsParams.
+
+        Every task returns a structured output constraint. Never returns None.
 
         Used as:
           - Online: extra_body={"structured_outputs": result}
@@ -470,6 +707,7 @@ class TaskConfig:
                         }
                     },
                     "required": ["labels"],
+                    "additionalProperties": False,
                 }
             }
 
@@ -495,31 +733,70 @@ class TaskConfig:
                                     },
                                 },
                                 "required": ["label", "box"],
+                                "additionalProperties": False,
                             },
                         }
                     },
                     "required": ["detections"],
+                    "additionalProperties": False,
                 }
             }
 
-        return None
+        if self.task == "vqa":
+            return {
+                "json": {
+                    "type": "object",
+                    "properties": {"answer": {"type": "string"}},
+                    "required": ["answer"],
+                    "additionalProperties": False,
+                }
+            }
 
-    # -- Output parsing --
+        if self.task in ("caption", "ocr"):
+            return {
+                "json": {
+                    "type": "object",
+                    "properties": {"text": {"type": "string"}},
+                    "required": ["text"],
+                    "additionalProperties": False,
+                }
+            }
+
+        if self.task == "custom":
+            return {
+                "json": {
+                    "type": "object",
+                    "properties": {"response": {"type": "string"}},
+                    "required": ["response"],
+                    "additionalProperties": False,
+                }
+            }
+
+        raise ValueError(f"No structured output schema for task: {self.task}")
+
+    # -- Output parsing (all responses are structured) --
 
     def parse_response(self, text: str) -> fo.Classification | fo.Classifications | fo.Detections | str:
         """Parse VLM response into a FiftyOne label or string.
 
-        For structured outputs (classify, tag, detect), the text is
-        guaranteed to be well-formed by vLLM's constrained generation.
+        All responses are structured: either JSON from json= constraint
+        or a bare string from choice= constraint. json.loads() is the
+        only parsing mechanism used.
         """
-        if self.output_type == "string":
-            return text.strip()
-
+        # Classify: choice= constraint, bare string output
         if self.output_type == "Classification":
             return fo.Classification(label=text.strip())
 
+        # All other tasks: JSON from json= constraint
+        data = json.loads(text)
+
+        # String-output tasks (caption, vqa, ocr, custom)
+        if self.output_type == "string":
+            key = self._STRING_KEYS[self.task]
+            return data[key]
+
+        # Tag: array of labels
         if self.output_type == "Classifications":
-            data = json.loads(text)
             return fo.Classifications(
                 classifications=[
                     fo.Classification(label=label)
@@ -527,56 +804,176 @@ class TaskConfig:
                 ]
             )
 
+        # Detect: array of {label, box} with post-generation validation
         if self.output_type == "Detections":
-            data = json.loads(text)
-            detections = []
-            for det in data["detections"]:
-                x1, y1, x2, y2 = det["box"]
-                # Convert from 0-1000 xyxy to FiftyOne's [0,1] xywh
-                x = x1 / 1000.0
-                y = y1 / 1000.0
-                w = (x2 - x1) / 1000.0
-                h = (y2 - y1) / 1000.0
-                detections.append(
-                    fo.Detection(
-                        label=det["label"],
-                        bounding_box=[x, y, w, h],
-                    )
-                )
-            return fo.Detections(detections=detections)
+            return self._parse_detections(data)
 
-        return text.strip()
+        raise ValueError(f"Unknown output type: {self.output_type}")
+
+    def _parse_detections(self, data: dict) -> fo.Detections:
+        """Post-generation validation for detection output.
+
+        The JSON structure is guaranteed by the schema constraint.
+        This method validates what schemas cannot enforce:
+        coordinate ranges, degenerate boxes, array lengths.
+        """
+        detections = []
+
+        # Determine coordinate scale based on format
+        if self.coordinate_format == "normalized_1000":
+            coord_max = 1000.0
+        elif self.coordinate_format == "normalized_1":
+            coord_max = 1.0
+        else:
+            # pixel mode: no clamping max, division handled differently
+            coord_max = None
+
+        for det in data.get("detections", []):
+            box = det.get("box", [])
+
+            # Validate array length (minItems/maxItems may not be enforced by xgrammar)
+            if len(box) != 4:
+                continue
+
+            x1, y1, x2, y2 = [float(v) for v in box]
+
+            if coord_max is not None:
+                # Clamp to valid coordinate range
+                x1 = max(0.0, min(x1, coord_max))
+                y1 = max(0.0, min(y1, coord_max))
+                x2 = max(0.0, min(x2, coord_max))
+                y2 = max(0.0, min(y2, coord_max))
+
+                # Skip degenerate boxes
+                if x2 <= x1 or y2 <= y1:
+                    continue
+
+                # Convert to FiftyOne [x, y, w, h] relative format (0-1)
+                x = x1 / coord_max
+                y = y1 / coord_max
+                w = min((x2 - x1) / coord_max, 1.0 - x)
+                h = min((y2 - y1) / coord_max, 1.0 - y)
+            else:
+                # Pixel mode: cannot convert without image dimensions
+                # Store as-is; caller must provide metadata for conversion
+                # This path is a placeholder for future per-sample metadata support
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                x, y, w, h = x1, y1, x2 - x1, y2 - y1
+
+            label = det.get("label", "object")
+
+            detections.append(fo.Detection(
+                label=label,
+                bounding_box=[x, y, w, h],
+            ))
+
+        return fo.Detections(detections=detections)
 ```
 
 ### 6.3 Image Content Builder (`utils.py`)
 
-Parallel construction of image content objects from file paths.
+Parallel construction of image content objects from file paths, mode-aware.
 
 ```python
+import base64
+import mimetypes
+import os
+from concurrent.futures import ThreadPoolExecutor
+from PIL import Image
+
+
 def build_image_contents(
     filepaths: list[str],
-    image_mode: str = "auto",        # "auto" | "base64" | "filepath"
-    base_url: str | None = None,     # Used by "auto" to detect local server
-    max_workers: int | None = None,
+    mode: str = "online",
+    image_mode: str = "auto",
+    base_url: str | None = None,
+    max_workers: int = 8,
 ) -> list[dict]:
-    """Convert file paths to OpenAI image_url content dicts. Parallelized.
+    """Build image content dicts for vLLM chat messages.
 
-    Returns list of: {"type":"image_url","image_url":{"url":"..."}}
+    Returns OpenAI-format dicts for online mode, or vLLM-extended
+    dicts with image_pil for offline mode. All I/O-bound work is
+    parallelized via ThreadPoolExecutor.
+
+    Args:
+        filepaths: absolute paths to image files.
+        mode: "online" or "offline" — determines valid content types.
+        image_mode: "auto" | "base64" | "filepath" | "pil"
+            - "auto": pil for offline; filepath for local online; base64 for remote online
+            - "filepath": file:// URL strings (online local servers only, no I/O)
+            - "base64": base64 data URIs (works everywhere, parallel I/O)
+            - "pil": PIL.Image objects (offline only, lazy-loaded)
+        base_url: vLLM server URL, used by "auto" to detect local servers.
+        max_workers: ThreadPoolExecutor size for parallel loading/encoding.
     """
-    ...
-```
+    resolved = _resolve_image_mode(mode, image_mode, base_url)
 
-- `"filepath"` mode: No I/O. Builds `{"url": "file:///absolute/path.jpg"}`. Instant.
-- `"base64"` mode: `ThreadPoolExecutor` reads + base64-encodes files in parallel.
-- `"auto"` mode: If `base_url` contains `localhost` or `127.0.0.1`, use filepath. Otherwise, base64.
+    if resolved == "filepath":
+        # No I/O — instant
+        return [_filepath_content(fp) for fp in filepaths]
+    elif resolved == "pil":
+        # PIL.Image.open() is lazy — reads header only, defers pixel decode to vLLM
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            images = list(pool.map(Image.open, filepaths))
+        return [{"type": "image_pil", "image_pil": img} for img in images]
+    elif resolved == "base64":
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            encoded = list(pool.map(_encode_base64, filepaths))
+        return encoded
+    else:
+        raise ValueError(f"Unknown resolved image mode: {resolved}")
+
+
+def _resolve_image_mode(mode, image_mode, base_url):
+    """Resolve the effective image mode from user settings and context."""
+    if image_mode != "auto":
+        # Validate mode/image_mode compatibility
+        if mode == "offline" and image_mode == "filepath":
+            # file:// not supported by LLM.chat() — fall back to pil
+            return "pil"
+        return image_mode
+    # Auto resolution
+    if mode == "offline":
+        return "pil"
+    # Online auto-detection: local server can use file paths
+    if base_url and any(h in base_url for h in ("localhost", "127.0.0.1", "0.0.0.0")):
+        return "filepath"
+    return "base64"
+
+
+def _filepath_content(filepath):
+    """Build file:// URL content dict (no I/O)."""
+    abspath = os.path.abspath(filepath)
+    return {
+        "type": "image_url",
+        "image_url": {"url": f"file://{abspath}"},
+    }
+
+
+def _encode_base64(filepath):
+    """Read and base64-encode a single image file."""
+    mime = mimetypes.guess_type(filepath)[0] or "image/jpeg"
+    with open(filepath, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("utf-8")
+    return {
+        "type": "image_url",
+        "image_url": {"url": f"data:{mime};base64,{b64}"},
+    }
+```
 
 ### 6.4 Operator (`operators.py`)
 
-Single operator for all VLM inference tasks. The `resolve_input` method uses FiftyOne's `types.*` API to build a dynamic form.
+Single operator for all VLM inference tasks. Uses FiftyOne's `types.*` API for a dynamic form.
 
 ```python
+import fiftyone as fo
 import fiftyone.operators as foo
 from fiftyone.operators import types
+
+from .engine import VLLMEngine
+from .tasks import TaskConfig
+from .utils import build_image_contents
 
 
 class VLLMInference(foo.Operator):
@@ -602,6 +999,7 @@ class VLLMInference(foo.Operator):
         task = _task_selector(ctx, inputs)
         _task_settings(ctx, inputs, task)
         _output_settings(ctx, inputs, task)
+        _field_conflict_check(ctx, inputs, task)
         _advanced_settings(ctx, inputs, mode)
         inputs.view_target(ctx)
 
@@ -611,91 +1009,139 @@ class VLLMInference(foo.Operator):
         return ctx.params.get("delegate", False)
 
     def execute(self, ctx):
-        # 1. Build engine from params
+        params = ctx.params
+
+        # 1. Resolve secrets with precedence: UI param > FiftyOne secret > env > default
+        api_key = (
+            params.get("api_key")
+            or ctx.secrets.get("FIFTYONE_VLLM_API_KEY", None)
+            or "EMPTY"
+        )
+        base_url = (
+            params.get("base_url")
+            or ctx.secrets.get("FIFTYONE_VLLM_BASE_URL", None)
+            or "http://localhost:8000/v1"
+        )
+
+        # 2. Resolve chat template
+        chat_template = params.get("chat_template") or None
+
+        # 3. Resolve device for offline mode
+        device = params.get("device") or None
+
+        # 4. Build engine
         engine = VLLMEngine(
-            model=ctx.params["model"],
-            mode=ctx.params["mode"],
-            base_url=ctx.params.get("base_url", "http://localhost:8000/v1"),
-            api_key=ctx.params.get("api_key", "EMPTY"),
-            temperature=ctx.params.get("temperature", 0.0),
-            max_tokens=ctx.params.get("max_tokens", 512),
-            top_p=ctx.params.get("top_p", 1.0),
+            model=params["model"],
+            mode=params.get("mode", "online"),
+            base_url=base_url,
+            api_key=api_key,
+            max_concurrent=params.get("max_concurrent", 64),
+            temperature=params.get("temperature", None),  # resolved below
+            max_tokens=params.get("max_tokens", 512),
+            top_p=params.get("top_p", 1.0),
             # Offline-only
-            tensor_parallel_size=ctx.params.get("tensor_parallel_size", 1),
-            gpu_memory_utilization=ctx.params.get("gpu_memory_utilization", 0.9),
-            max_model_len=ctx.params.get("max_model_len") or None,
+            tensor_parallel_size=params.get("tensor_parallel_size", 1),
+            gpu_memory_utilization=params.get("gpu_memory_utilization", 0.9),
+            max_model_len=params.get("max_model_len") or None,
+            chat_template=chat_template,
+            device=device,
         )
 
         try:
-            # 2. Build task config
+            # 5. Validate connection (online mode)
+            if engine.mode == "online":
+                engine.validate_connection()
+
+            # 6. Build task config
             classes = None
-            raw_classes = ctx.params.get("classes")
+            raw_classes = params.get("classes")
             if raw_classes:
                 classes = [c.strip() for c in raw_classes.split(",")]
 
             task = TaskConfig(
-                task=ctx.params["task"],
-                prompt=ctx.params.get("prompt_override") or ctx.params.get("prompt"),
-                system_prompt=ctx.params.get("system_prompt"),
+                task=params["task"],
+                prompt=params.get("prompt_override") or params.get("prompt"),
+                system_prompt=params.get("system_prompt"),
                 classes=classes,
-                question=ctx.params.get("question", ""),
+                coordinate_format=params.get("coordinate_format", "normalized_1000"),
+                question=params.get("question", ""),
             )
 
-            # 3. Get target samples
+            # Apply task-specific temperature default if user didn't override
+            if params.get("temperature") is None:
+                engine.temperature = task.default_temperature
+
+            # 7. Get target samples
             view = ctx.target_view()
             ids = view.values("id")
             filepaths = view.values("filepath")
             total = len(ids)
-            batch_size = ctx.params.get("batch_size", 32)
-            output_field = ctx.params["output_field"]
+            batch_size = params.get("batch_size", 32)
+            output_field = params["output_field"]
+            max_workers = params.get("max_workers", 8)
 
             # Get structured output constraints from task
             structured_outputs = task.get_structured_outputs()
 
-            # 4. Process in batches
+            # 8. Process in batches
             processed = 0
+            total_errors = 0
+
             for i in range(0, total, batch_size):
                 batch_ids = ids[i:i + batch_size]
                 batch_paths = filepaths[i:i + batch_size]
 
-                # 4a. Parallel image content construction
+                # 8a. Parallel image content construction
                 image_contents = build_image_contents(
                     batch_paths,
-                    image_mode=ctx.params.get("image_mode", "auto"),
-                    base_url=ctx.params.get("base_url"),
+                    mode=engine.mode,
+                    image_mode=params.get("image_mode", "auto"),
+                    base_url=base_url,
+                    max_workers=max_workers,
                 )
 
-                # 4b. Build messages for each image
+                # 8b. Build messages for each image
                 batch_messages = [task.build_messages(img) for img in image_contents]
 
-                # 4c. Batch inference with structured output
+                # 8c. Batch inference with structured output
                 responses = engine.infer_batch(
                     batch_messages,
                     structured_outputs=structured_outputs,
                 )
 
-                # 4d. Parse responses and bulk-write to dataset
-                results = {
-                    sid: task.parse_response(resp)
-                    for sid, resp in zip(batch_ids, responses)
-                }
-                ctx.dataset.set_values(output_field, results, key_field="id")
+                # 8d. Parse responses with per-sample error handling
+                results = {}
+                errors = {}
+                for sid, resp in zip(batch_ids, responses):
+                    try:
+                        results[sid] = task.parse_response(resp)
+                    except Exception as e:
+                        errors[sid] = f"{type(e).__name__}: {e}"
+                        total_errors += 1
 
-                # 4e. Progress
-                processed += len(batch_ids)
-                if ctx.delegated:
-                    ctx.set_progress(
-                        progress=processed / total,
-                        label=f"{processed}/{total} samples",
+                # 8e. Bulk-write results and errors
+                if results:
+                    ctx.dataset.set_values(output_field, results, key_field="id")
+                if errors:
+                    ctx.dataset.set_values(
+                        f"{output_field}_error", errors, key_field="id"
                     )
+
+                # 8f. Progress
+                processed += len(batch_ids)
+                label = f"{processed}/{total} samples"
+                if total_errors:
+                    label += f" ({total_errors} errors)"
+
+                if ctx.delegated:
+                    ctx.set_progress(progress=processed / total, label=label)
                 else:
                     yield ctx.trigger(
                         "set_progress",
-                        dict(progress=processed / total,
-                             label=f"{processed}/{total} samples"),
+                        dict(progress=processed / total, label=label),
                     )
 
-            # 5. Reload dataset in App
+            # 9. Reload dataset in App
             if not ctx.delegated:
                 yield ctx.trigger("reload_dataset")
 
@@ -712,11 +1158,7 @@ class VLLMInference(foo.Operator):
 
 ## 7. Operator UI Specification
 
-All helper functions used in `resolve_input()` are defined below with their exact FiftyOne `types.*` API usage.
-
 ### 7.1 `_mode_selector(ctx, inputs)`
-
-Inference mode: Online (API server) or Offline (local vLLM).
 
 ```python
 def _mode_selector(ctx, inputs):
@@ -739,14 +1181,27 @@ def _mode_selector(ctx, inputs):
         label="Inference Mode",
         view=mode_radio,
     )
-    return ctx.params.get("mode", "online")
+    mode = ctx.params.get("mode", "online")
+
+    if mode == "offline":
+        try:
+            import vllm
+            from packaging.version import Version
+            if Version(vllm.__version__) < Version("0.16.0"):
+                inputs.view("vllm_version", types.Error(
+                    label=f"vllm>=0.16.0 required, found {vllm.__version__}. "
+                          f"Upgrade with: pip install 'vllm>=0.16.0'"
+                ))
+        except ImportError:
+            inputs.view("vllm_missing", types.Error(
+                label="vllm>=0.16.0 is required for offline mode. "
+                      "Install with: pip install 'vllm>=0.16.0'"
+            ))
+
+    return mode
 ```
 
-**Produces**: `ctx.params["mode"]` → `"online"` or `"offline"`
-
 ### 7.2 `_model_selector(ctx, inputs)`
-
-Model ID/name input.
 
 ```python
 def _model_selector(ctx, inputs):
@@ -758,11 +1213,7 @@ def _model_selector(ctx, inputs):
     )
 ```
 
-**Produces**: `ctx.params["model"]` → `"Qwen/Qwen2.5-VL-7B-Instruct"`
-
 ### 7.3 `_server_settings(ctx, inputs)`
-
-Server connection settings (shown only when mode is "online").
 
 ```python
 def _server_settings(ctx, inputs):
@@ -782,45 +1233,25 @@ def _server_settings(ctx, inputs):
     )
 ```
 
-**Produces**: `ctx.params["base_url"]`, `ctx.params["api_key"]`
-
-**Conditional display**: Only rendered when `mode == "online"` (controlled by the `if mode == "online":` check in `resolve_input`).
-
 ### 7.4 `_task_selector(ctx, inputs)`
-
-Task type dropdown (single-select).
 
 ```python
 def _task_selector(ctx, inputs):
     task_dropdown = types.Dropdown(label="Task")
-    task_dropdown.add_choice(
-        "caption", label="Caption",
-        description="Generate a text description of the image",
-    )
-    task_dropdown.add_choice(
-        "classify", label="Classify",
-        description="Assign a single class label (constrained output)",
-    )
-    task_dropdown.add_choice(
-        "tag", label="Tag",
-        description="Assign multiple labels (constrained JSON output)",
-    )
-    task_dropdown.add_choice(
-        "detect", label="Detect",
-        description="Detect objects with bounding boxes (constrained JSON output)",
-    )
-    task_dropdown.add_choice(
-        "vqa", label="VQA",
-        description="Answer a question about the image",
-    )
-    task_dropdown.add_choice(
-        "ocr", label="OCR",
-        description="Extract text visible in the image",
-    )
-    task_dropdown.add_choice(
-        "custom", label="Custom",
-        description="Custom prompt with free-form response",
-    )
+    task_dropdown.add_choice("caption", label="Caption",
+        description="Generate a text description of the image")
+    task_dropdown.add_choice("classify", label="Classify",
+        description="Assign a single class label (constrained output)")
+    task_dropdown.add_choice("tag", label="Tag",
+        description="Assign multiple labels (constrained JSON output)")
+    task_dropdown.add_choice("detect", label="Detect",
+        description="Detect objects with bounding boxes (constrained JSON output)")
+    task_dropdown.add_choice("vqa", label="VQA",
+        description="Answer a question about the image")
+    task_dropdown.add_choice("ocr", label="OCR",
+        description="Extract text visible in the image")
+    task_dropdown.add_choice("custom", label="Custom",
+        description="Custom prompt with free-form response")
     inputs.enum(
         "task",
         task_dropdown.values(),
@@ -831,11 +1262,7 @@ def _task_selector(ctx, inputs):
     return ctx.params.get("task", None)
 ```
 
-**Produces**: `ctx.params["task"]` → one of `"caption"`, `"classify"`, `"tag"`, `"detect"`, `"vqa"`, `"ocr"`, `"custom"`
-
 ### 7.5 `_task_settings(ctx, inputs, task)`
-
-Conditional fields that appear based on the selected task.
 
 ```python
 def _task_settings(ctx, inputs, task):
@@ -846,81 +1273,37 @@ def _task_settings(ctx, inputs, task):
 
     # Classes input (classify, tag, detect)
     if task in ("classify", "tag"):
-        inputs.str(
-            "classes",
-            label="Classes",
-            required=True,
-            description="Comma-separated class names (e.g., cat, dog, bird)",
-        )
+        inputs.str("classes", label="Classes", required=True,
+            description="Comma-separated class names (e.g., cat, dog, bird)")
     elif task == "detect":
-        inputs.str(
-            "classes",
-            label="Classes",
-            required=False,
-            description="Optional: comma-separated class names to detect (leave empty for open detection)",
-        )
+        inputs.str("classes", label="Classes", required=False,
+            description="Optional: comma-separated classes to detect (leave empty for open detection)")
 
     # Question input (VQA)
     if task == "vqa":
-        inputs.str(
-            "question",
-            label="Question",
-            required=True,
-            description="Question to ask about each image",
-        )
+        inputs.str("question", label="Question", required=True,
+            description="Question to ask about each image")
 
     # Custom prompt input
     if task == "custom":
-        inputs.str(
-            "prompt",
-            label="Prompt",
-            required=True,
-            description="Prompt to send with each image",
-        )
-        inputs.str(
-            "system_prompt",
-            label="System Prompt",
-            required=False,
-            description="Optional system prompt for context",
-        )
+        inputs.str("prompt", label="Prompt", required=True,
+            description="Prompt to send with each image")
+        inputs.str("system_prompt", label="System Prompt", required=False,
+            description="Optional system prompt for context")
 
     # Prompt override for non-custom tasks
     if task not in ("custom",):
-        inputs.str(
-            "prompt_override",
-            label="Prompt Override",
-            required=False,
-            description="Override the default prompt for this task",
-        )
+        inputs.str("prompt_override", label="Prompt Override", required=False,
+            description="Override the default prompt for this task")
 ```
-
-**Conditional display logic**:
-
-| Task | Fields shown |
-|------|-------------|
-| `caption` | prompt_override |
-| `classify` | classes (required), prompt_override |
-| `tag` | classes (required), prompt_override |
-| `detect` | classes (optional), prompt_override |
-| `vqa` | question (required), prompt_override |
-| `ocr` | prompt_override |
-| `custom` | prompt (required), system_prompt |
 
 ### 7.6 `_output_settings(ctx, inputs, task)`
 
-Output field name with task-appropriate defaults.
+Each task has its own default field name to prevent type conflicts.
 
 ```python
 def _output_settings(ctx, inputs, task):
-    defaults = {
-        "caption": "caption",
-        "classify": "classification",
-        "tag": "tags",
-        "detect": "detections",
-        "vqa": "vqa_answer",
-        "ocr": "ocr_text",
-        "custom": "vlm_output",
-    }
+    defaults = {t: v["default_field"] for t, v in TaskConfig.TASKS.items()}
     inputs.str(
         "output_field",
         label="Output Field",
@@ -930,114 +1313,186 @@ def _output_settings(ctx, inputs, task):
     )
 ```
 
-**Produces**: `ctx.params["output_field"]` → field name string
+### 7.7 `_field_conflict_check(ctx, inputs, task)`
 
-### 7.7 `_advanced_settings(ctx, inputs, mode)`
+Warn early if the output field already exists with an incompatible type.
 
-Advanced settings behind a toggle.
+```python
+def _field_conflict_check(ctx, inputs, task):
+    """Check for field type conflicts and warn in the UI."""
+    output_field = ctx.params.get("output_field")
+    if not output_field or not ctx.dataset:
+        return
+
+    existing = ctx.dataset.get_field(output_field)
+    if existing is None:
+        return  # Field doesn't exist yet, no conflict
+
+    expected_types = {
+        "caption": fo.StringField,
+        "classify": fo.EmbeddedDocumentField,
+        "tag": fo.EmbeddedDocumentField,
+        "detect": fo.EmbeddedDocumentField,
+        "vqa": fo.StringField,
+        "ocr": fo.StringField,
+        "custom": fo.StringField,
+    }
+    expected = expected_types.get(task)
+    if expected and not isinstance(existing, expected):
+        inputs.view(
+            "field_warning",
+            types.Warning(
+                label=f"Field '{output_field}' already exists with type "
+                      f"{type(existing).__name__}. This task writes "
+                      f"{expected.__name__}. Choose a different field name "
+                      f"to avoid conflicts."
+            ),
+        )
+```
+
+### 7.8 `_advanced_settings(ctx, inputs, mode)`
+
+Includes concurrency controls, chat template override, and device selection.
 
 ```python
 def _advanced_settings(ctx, inputs, mode):
     inputs.view("adv_header", types.Header(label="Advanced Settings", divider=True))
     inputs.bool(
-        "show_advanced",
-        label="Show advanced settings",
-        default=False,
-        view=types.SwitchView(),
+        "show_advanced", label="Show advanced settings",
+        default=False, view=types.SwitchView(),
     )
-
     if not ctx.params.get("show_advanced", False):
         return
 
     # -- Sampling parameters (all modes) --
-    inputs.float(
-        "temperature", label="Temperature",
-        default=0.0, min=0.0, max=2.0,
-        description="Sampling temperature (0.0 = deterministic)",
-    )
-    inputs.int(
-        "max_tokens", label="Max Tokens",
+    inputs.float("temperature", label="Temperature",
+        default=None, min=0.0, max=2.0,
+        description="Sampling temperature (leave empty for task-specific default)")
+    inputs.int("max_tokens", label="Max Tokens",
         default=512, min=1, max=4096,
-        description="Maximum tokens to generate per sample",
-    )
-    inputs.float(
-        "top_p", label="Top P",
-        default=1.0, min=0.0, max=1.0,
-    )
-    inputs.int(
-        "batch_size", label="Batch Size",
+        description="Maximum tokens to generate per sample")
+    inputs.float("top_p", label="Top P", default=1.0, min=0.0, max=1.0)
+    inputs.int("batch_size", label="Batch Size",
         default=32, min=1, max=512,
-        description="Number of samples per inference batch",
-    )
+        description="Number of samples per inference batch")
+
+    # -- Parallelism controls --
+    if mode == "online":
+        inputs.int("max_concurrent", label="Max Concurrent Requests",
+            default=64, min=1, max=256,
+            description="Maximum parallel HTTP requests to vLLM server")
+    inputs.int("max_workers", label="Image Loading Workers",
+        default=8, min=1, max=32,
+        description="Thread pool size for parallel image loading/encoding")
 
     # -- Image handling --
     image_dropdown = types.Dropdown()
-    image_dropdown.add_choice("auto", label="Auto", description="Detect based on server URL")
-    image_dropdown.add_choice("filepath", label="File Path", description="file:// paths (local servers only)")
-    image_dropdown.add_choice("base64", label="Base64", description="Base64-encoded (works everywhere)")
-    inputs.enum(
-        "image_mode",
-        image_dropdown.values(),
-        default="auto",
-        label="Image Mode",
-        view=image_dropdown,
-    )
+    image_dropdown.add_choice("auto", label="Auto",
+        description="Best option based on mode and server location")
+    image_dropdown.add_choice("base64", label="Base64",
+        description="Base64-encoded (works everywhere)")
+    if mode == "online":
+        image_dropdown.add_choice("filepath", label="File Path",
+            description="file:// paths (local servers with --allowed-local-media-path)")
+    if mode == "offline":
+        image_dropdown.add_choice("pil", label="PIL Image",
+            description="PIL Image objects (recommended for offline mode)")
+    inputs.enum("image_mode", image_dropdown.values(),
+        default="auto", label="Image Mode", view=image_dropdown)
+
+    # -- Chat template override --
+    inputs.str("chat_template", label="Chat Template", required=False,
+        description="Raw Jinja2 chat template string or file path (for models without a built-in template, e.g., LLaVA-1.5)")
+
+    # -- Detection coordinate format --
+    task = ctx.params.get("task")
+    if task == "detect":
+        coord_dropdown = types.Dropdown()
+        coord_dropdown.add_choice("normalized_1000", label="0-1000 (Qwen default)")
+        coord_dropdown.add_choice("normalized_1", label="0-1 (relative)")
+        coord_dropdown.add_choice("pixel", label="Pixel coordinates")
+        inputs.enum("coordinate_format", coord_dropdown.values(),
+            default="normalized_1000", label="Coordinate Format",
+            view=coord_dropdown,
+            description="Bounding box coordinate convention used by the model")
 
     # -- Offline-only engine settings --
     if mode == "offline":
-        inputs.view("offline_header", types.Header(label="Offline Engine Settings", divider=True))
-        inputs.int(
-            "tensor_parallel_size", label="Tensor Parallel Size",
+        inputs.view("offline_header", types.Header(
+            label="Offline Engine Settings", divider=True))
+        inputs.int("tensor_parallel_size", label="Tensor Parallel Size",
             default=1, min=1, max=8,
-            description="Number of GPUs for tensor parallelism",
-        )
-        inputs.float(
-            "gpu_memory_utilization", label="GPU Memory Utilization",
+            description="Number of GPUs for tensor parallelism")
+        inputs.float("gpu_memory_utilization", label="GPU Memory Utilization",
             default=0.9, min=0.1, max=1.0,
-            description="Fraction of GPU memory to use",
-        )
-        inputs.int(
-            "max_model_len", label="Max Model Length",
+            description="Fraction of GPU memory to use")
+        inputs.int("max_model_len", label="Max Model Length",
             default=0, min=0, max=131072,
-            description="Max context length (0 = model default)",
-        )
-```
+            description="Max context length (0 = auto from model config)")
 
-**Produces** (when expanded): `ctx.params["temperature"]`, `ctx.params["max_tokens"]`, `ctx.params["top_p"]`, `ctx.params["batch_size"]`, `ctx.params["image_mode"]`, plus offline-specific params.
+        # GPU device selection
+        _device_selector(ctx, inputs)
+
+
+def _device_selector(ctx, inputs):
+    """GPU device selection for offline mode."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            inputs.view("no_gpu", types.Warning(label="No GPU detected"))
+            return
+        num_gpus = torch.cuda.device_count()
+    except ImportError:
+        num_gpus = 0
+
+    if num_gpus == 0:
+        inputs.view("no_gpu", types.Warning(label="No GPU detected"))
+        return
+
+    device_choices = types.Dropdown()
+    device_choices.add_choice("auto", label="Auto (all available GPUs)")
+    for i in range(num_gpus):
+        try:
+            name = torch.cuda.get_device_name(i)
+            device_choices.add_choice(str(i), label=f"GPU {i}: {name}")
+        except Exception:
+            device_choices.add_choice(str(i), label=f"GPU {i}")
+
+    inputs.enum(
+        "device", device_choices.values(),
+        default="auto", label="GPU Device",
+        view=device_choices,
+        description="GPU device(s) for offline inference",
+    )
+```
 
 ---
 
 ## 8. Critical Technical Decisions
 
-### 8.1 Chat Templates Are Handled by vLLM
+### 8.1 Chat Templates Are Handled by vLLM — With User Override
 
-Both `LLM.chat()` (offline) and `/v1/chat/completions` (online) automatically apply the correct Jinja2 chat template per model. The plugin always uses the universal OpenAI message format:
+Both `LLM.chat()` (offline) and `/v1/chat/completions` (online) automatically apply the correct Jinja2 chat template per model. The plugin always uses the universal OpenAI message format. For models without a built-in template (e.g., LLaVA-1.5), users can supply a custom template as a raw Jinja2 string or a file path via the advanced settings. The template resolution is deterministic: same model + same template = same prompt formatting every time.
 
-```python
-[{"role": "user", "content": [
-    {"type": "image_url", "image_url": {"url": "..."}},
-    {"type": "text", "text": "..."},
-]}]
-```
+### 8.2 Structured Output is Universal
 
-### 8.2 Structured Output Eliminates Text Parsing
-
-| Task | Constraint | Why no parsing needed |
-|------|-----------|----------------------|
-| Classify | `StructuredOutputsParams(choice=classes)` | Output is exactly one class name |
-| Tag | `StructuredOutputsParams(json=schema)` | Output is valid JSON with enum-constrained labels |
-| Detect | `StructuredOutputsParams(json=schema)` | Output is valid JSON with label+box arrays |
-| Caption/VQA/OCR/Custom | None | Output is free text, stored as-is |
+| Task | Constraint | What's guaranteed | What requires post-validation |
+|------|-----------|-------------------|-------------------------------|
+| Classify | `choice=classes` | Output is exactly one class name | Nothing |
+| Tag | `json=schema` with enum | Valid JSON with enum-constrained labels | Nothing |
+| Detect | `json=schema` | Valid JSON structure | Box length (xgrammar may ignore minItems/maxItems), coordinate ranges, degenerate boxes |
+| Caption | `json={"text": string}` | Valid JSON wrapping text | Nothing |
+| VQA | `json={"answer": string}` | Valid JSON wrapping answer | Nothing |
+| OCR | `json={"text": string}` | Valid JSON wrapping text | Nothing |
+| Custom | `json={"response": string}` | Valid JSON wrapping response | Nothing |
 
 ### 8.3 Image Transfer Strategy
 
-| Scenario | Strategy | Why |
-|----------|----------|-----|
-| Offline mode | `file://` paths | vLLM loads directly, zero copy |
-| Online, local server | `file://` paths (with `--allowed-local-media-path`) | Zero copy |
-| Online, remote server | Parallel base64 encoding via ThreadPool | Only option |
-
-Auto-detection: if `base_url` contains `localhost` or `127.0.0.1`, use file paths. Otherwise, base64.
+| Scenario | Strategy | Content type | Why |
+|----------|----------|-------------|-----|
+| Offline mode | PIL.Image.open() | `image_pil` | Lazy-loaded; vLLM decodes pixels internally; **file:// is not supported by LLM.chat()** |
+| Online, local server | `file://` paths | `image_url` | Zero I/O; requires `--allowed-local-media-path` on server |
+| Online, remote server | Parallel base64 | `image_url` | Only universally portable option |
 
 ### 8.4 Bulk Writes via `set_values()`
 
@@ -1045,15 +1500,25 @@ Auto-detection: if `base_url` contains `localhost` or `127.0.0.1`, use file path
 
 ### 8.5 Offline Mode: Single LLM Instance
 
-The `vllm.LLM` object is instantiated once and reused for all batches. Cleaned up in `engine.cleanup()` via the operator's `finally` block.
+The `vllm.LLM` object is instantiated once and reused for all batches. vLLM automatically manages batching within `LLM.chat()` calls based on available KV cache memory, regardless of how many messages are passed. The `batch_size` parameter in the operator controls how many samples are prepared and sent to vLLM at once, not vLLM's internal batch scheduling. Cleaned up in `engine.cleanup()` via the operator's `finally` block.
 
 ### 8.6 Online Mode: Async Concurrency
 
-`AsyncOpenAI` with `asyncio.Semaphore(max_concurrent)`. All requests in a batch are fired concurrently. The semaphore prevents overwhelming the server. vLLM's continuous batching handles the rest.
+`AsyncOpenAI` with `asyncio.Semaphore(max_concurrent)` wrapped in `_run_async()` for event-loop safety. All requests in a batch are fired concurrently. The semaphore prevents overwhelming the server. vLLM's continuous batching handles the rest. The `_run_async()` helper detects existing event loops (e.g., FiftyOne's App server) and runs async code in a dedicated thread to avoid `RuntimeError`.
 
 ### 8.7 Detection Coordinate Convention
 
-The plugin prompts for and expects 0-1000 coordinate space (matching Qwen2.5-VL's native grounding format). Conversion to FiftyOne's `[x, y, w, h]` relative format (0-1 range): divide by 1000, convert xyxy→xywh.
+Configurable via `coordinate_format` advanced setting. Default is `normalized_1000` matching Qwen2-VL/Qwen2.5-VL/Qwen3-VL's native grounding format. Detection accuracy and coordinate format vary significantly across model families — this task is not "universal" in the way classification and captioning are. The system prompt reflects the chosen coordinate convention.
+
+### 8.8 GPU Device Selection
+
+For offline mode, users can select specific GPU device(s). The selection maps to `CUDA_VISIBLE_DEVICES`:
+
+| Selection | Behavior |
+|-----------|----------|
+| `auto` | All available GPUs (vLLM manages) |
+| Single GPU (e.g., `0`) | `CUDA_VISIBLE_DEVICES=0` |
+| Multiple GPUs require `tensor_parallel_size` ≥ 2 |
 
 ---
 
@@ -1090,14 +1555,20 @@ engine = VLLMEngine(model="Qwen/Qwen2.5-VL-7B-Instruct", mode="online")
 task = TaskConfig(task="classify", classes=["indoor", "outdoor"])
 
 filepaths = dataset.values("filepath")
-images = build_image_contents(filepaths, image_mode="base64")
+images = build_image_contents(filepaths, mode="online", image_mode="base64")
 messages = [task.build_messages(img) for img in images]
 responses = engine.infer_batch(
     messages,
     structured_outputs=task.get_structured_outputs(),
 )
 
-results = {sid: task.parse_response(r) for sid, r in zip(dataset.values("id"), responses)}
+results = {}
+for sid, r in zip(dataset.values("id"), responses):
+    try:
+        results[sid] = task.parse_response(r)
+    except Exception:
+        pass  # handle errors
+
 dataset.set_values("scene_type", results, key_field="id")
 engine.cleanup()
 ```
@@ -1111,23 +1582,26 @@ engine.cleanup()
 **Track A: `engine.py` + `utils.py`**
 
 1. `VLLMEngine.__init__()` for online mode (AsyncOpenAI client setup)
-2. `_online_batch()` with async concurrency, semaphore, `structured_outputs` via `extra_body`
+2. `_async_online_batch()` with semaphore + event-loop-safe `_run_async()`
 3. `build_image_contents()` — filepath mode (string formatting, no I/O)
 4. `build_image_contents()` — base64 mode (ThreadPoolExecutor parallel I/O)
-5. `build_image_contents()` — auto-detection logic
-6. `VLLMEngine.__init__()` for offline mode (vLLM LLM instantiation, lazy import)
-7. `_offline_batch()` using `LLM.chat()` with `StructuredOutputsParams`
-8. `cleanup()` with GPU memory freeing
+5. `build_image_contents()` — pil mode (ThreadPoolExecutor parallel PIL.Image.open)
+6. `build_image_contents()` — auto-detection logic (mode-aware)
+7. `VLLMEngine.__init__()` for offline mode (lazy vllm import, `LLM()` instantiation, device selection)
+8. `_offline_batch()` using `LLM.chat()` with `StructuredOutputsParams` + optional `chat_template`
+9. `cleanup()` with GPU memory freeing
+10. `list_models()` and `validate_connection()` for online mode
+11. `_resolve_chat_template()` — file path or raw string
 
 **Track B: `tasks.py`**
 
-1. `TaskConfig.__init__()` with 7 task defaults and prompt template formatting
-2. `build_messages()` — OpenAI message format construction
-3. `get_structured_outputs()` — returns `StructuredOutputsParams` kwargs for classify (choice), tag (json), detect (json)
-5. `parse_response()` for string output (caption, vqa, ocr, custom)
-6. `parse_response()` for Classification (classify — direct label from structured choice)
-7. `parse_response()` for Classifications (tag — JSON parse to fo.Classifications)
-8. `parse_response()` for Detections (detect — JSON parse + coordinate conversion to fo.Detections)
+1. `TaskConfig.__init__()` with 7 task defaults (all with JSON system prompts), prompt template formatting, coordinate_format
+2. `build_messages()` — works with both `image_url` and `image_pil` content types
+3. `get_structured_outputs()` — returns `dict` (never `None`) for all 7 tasks: choice for classify, json schemas for all others
+4. `parse_response()` for string tasks (caption, vqa, ocr, custom — `json.loads()` → extract named key)
+5. `parse_response()` for Classification (classify — direct label from structured choice)
+6. `parse_response()` for Classifications (tag — JSON parse to fo.Classifications)
+7. `_parse_detections()` — receives parsed dict, applies **post-generation validation** (coordinate clamping, degenerate box filtering, array length checks, configurable coordinate format)
 
 ### Phase 2: FiftyOne Integration
 
@@ -1136,26 +1610,33 @@ engine.cleanup()
 1. `fiftyone.yml` manifest
 2. `_mode_selector()` — RadioGroup for online/offline
 3. `_model_selector()` — text input for model ID
-4. `_server_settings()` — base_url and api_key fields
+4. `_server_settings()` — base_url and api_key fields (conditional on online mode)
 5. `_task_selector()` — Dropdown with 7 task choices
-6. `_task_settings()` — conditional fields per task (classes, question, prompt, system_prompt, prompt_override)
-7. `_output_settings()` — output field name with task-specific defaults
-8. `_advanced_settings()` — SwitchView toggle, sampling params, image mode, offline engine settings
-9. `execute()` — batch loop, image prep, inference, parsing, set_values, progress
-10. `resolve_delegation()` and `resolve_output()`
-11. `__init__.py` with `register()` function
-12. `requirements.txt`
+6. `_task_settings()` — conditional fields per task
+7. `_output_settings()` — task-specific default field names
+8. `_field_conflict_check()` — early warning for field type conflicts
+9. `_advanced_settings()` — sampling params, concurrency controls, image mode, chat template, coordinate format, device selector, offline engine settings
+10. `execute()` — connection validation, batch loop, image prep, inference, per-sample error handling, set_values, progress
+11. `resolve_delegation()` and `resolve_output()`
+12. `__init__.py` with `register()` function
+13. `requirements.txt`
 
 ### Phase 3: Testing
 
-1. Online mode: classify task with structured_outputs(choice=) against a vLLM server
-2. Online mode: tag task with structured_outputs(json=)
-3. Online mode: caption task (free text)
-4. Online mode: detect task with structured_outputs(json=)
-5. Offline mode: classify + tag + caption with local vLLM
-6. Progress reporting (immediate and delegated)
-7. Base64 vs filepath image modes
-8. Edge cases: empty dataset, missing files, model errors, max_tokens too low for JSON
+1. Online mode: classify with `structured_outputs(choice=)` against a vLLM server
+2. Online mode: tag with `structured_outputs(json=)`
+3. Online mode: caption with `structured_outputs(json={"text": string})` — verify JSON wrapper
+4. Online mode: detect with `structured_outputs(json=)` + coordinate validation
+5. Online mode: vqa with `structured_outputs(json={"answer": string})` — verify JSON wrapper
+6. Offline mode: classify + tag + caption using `LLM.chat()` with `image_pil`
+7. Offline mode: detect with custom `chat_template`
+7. Progress reporting (immediate and delegated)
+8. Image modes: base64, filepath, pil (verify correct resolution per mode)
+9. Per-sample error handling: corrupted image in batch, truncated JSON response
+10. Event loop safety: online mode called from within FiftyOne App server
+11. Field conflict detection: re-run with incompatible output field
+12. Edge cases: empty dataset, missing files, model errors, max_tokens too low for JSON
+13. Device selection: single GPU, multi-GPU with tensor parallelism
 
 ### Parallelization Summary
 
@@ -1168,8 +1649,6 @@ Phase 2:  Track C (operator + plugin wiring) ─┐
 Phase 3:  Testing ─────────────────────────────>
 ```
 
-Tracks A and B have zero dependencies and can be built simultaneously.
-
 ---
 
 ## 11. Plugin Manifest + Requirements
@@ -1181,7 +1660,7 @@ name: "@fo-vllm/vllm"
 type: plugin
 author: "fo-vllm contributors"
 version: "0.1.0"
-description: "Universal VLM inference via vLLM -- any model, any task, online or offline"
+description: "Universal VLM inference via vLLM — any model, any task, online or offline"
 fiftyone:
   version: ">=0.25"
 operators:
@@ -1193,13 +1672,58 @@ secrets:
 
 ### `requirements.txt`
 
+Core dependencies installed by FiftyOne's plugin system (`fiftyone plugins requirements <n> --install`):
+
 ```
 openai>=1.0
-vllm>=0.8.5
 pillow>=9.0
 ```
 
-Note: `vllm>=0.8.5` is required for the `StructuredOutputsParams` API used by this plugin. `vllm` is only required for offline mode. Online mode only needs `openai`. The plugin should handle the case where `vllm` is not installed and restrict to online-only mode with a clear message.
+These are sufficient for **online mode**. They are lightweight and have no GPU/CUDA requirements.
+
+### `requirements-local.txt`
+
+For users who want offline mode or prefer a one-command install:
+
+```
+# requirements-local.txt
+# Install with: pip install -r requirements-local.txt
+openai>=1.0
+pillow>=9.0
+vllm>=0.16.0
+```
+
+This file is **not** consumed by FiftyOne's plugin system (which only reads `requirements.txt`), but is provided for CI/CD pipelines, Docker images, and users who want a single `pip install -r` command.
+
+### Dependency strategy rationale
+
+FiftyOne plugins use a flat `requirements.txt` read by `fop.ensure_plugin_requirements()`. There is no native support for extras, optional groups, or multiple requirements files in the FiftyOne plugin ecosystem. Grouped/optional dependencies via `pyproject.toml` would require users to `pip install -e .` the plugin directory separately, conflicting with FiftyOne's directory-based plugin management.
+
+The chosen approach:
+- `requirements.txt` covers online mode (the common case) — lightweight, no GPU deps
+- Offline mode requires manual `pip install 'vllm>=0.16.0'`
+- The operator UI surfaces a clear error with the exact install command when offline mode is selected and vllm is missing or outdated (see `_mode_selector()` in Section 7.1)
+- The engine performs a version floor check at import time:
+
+```python
+def _import_vllm():
+    try:
+        import vllm
+        from packaging.version import Version
+        if Version(vllm.__version__) < Version("0.16.0"):
+            raise ImportError(
+                f"vllm>=0.16.0 required, found {vllm.__version__}. "
+                f"Upgrade with: pip install 'vllm>=0.16.0'"
+            )
+        return vllm
+    except ImportError:
+        raise ImportError(
+            "Offline mode requires vllm>=0.16.0. "
+            "Install with: pip install 'vllm>=0.16.0'"
+        )
+```
+
+If FiftyOne's plugin system adds extras support in the future, a `pyproject.toml` with `[local]` extra group can be trivially added.
 
 ---
 
@@ -1207,22 +1731,19 @@ Note: `vllm>=0.8.5` is required for the `StructuredOutputsParams` API used by th
 
 | Feature | How Architecture Supports It |
 |---------|------------------------------|
-| **Structured JSON extraction** | Add a `"json_extract"` task to TaskConfig with user-provided JSON schema passed to `structured_outputs(json=)` |
+| **Structured JSON extraction** | Add `"json_extract"` task to TaskConfig with user-provided schema → `structured_outputs(json=)` |
 | **Multi-image per sample** | Extend `build_messages()` to accept multiple images per sample |
 | **Video understanding** | Add video frame extraction to utils; some VLMs support video inputs |
 | **Per-sample prompts from field** | Read prompt per-sample from a dataset field (e.g., `sample["question"]`) |
 | **LoRA adapter selection** | vLLM supports runtime LoRA loading; add adapter parameter to engine |
+| **Rate limiting** | Add requests-per-second throttle for external API endpoints (OpenAI, Together AI, etc.) |
 | **Model comparison** | Run multiple models and store results in different fields |
 | **Embeddings extraction** | Add embedding extraction mode for VLMs that expose embeddings |
 | **FiftyOne Model Zoo** | Wrap VLLMEngine in `fo.Model` for `foz.load_zoo_model()` compat |
 | **Panel UI** | React panel for interactive VLM chat with selected images |
 | **Streaming responses** | vLLM streaming for interactive panel use |
-| **Keypoint estimation** | Add `"keypoint"` task with structured_outputs(json=) schema → `fo.Keypoints` |
-| **Segmentation polygons** | Add `"segment"` task with structured_outputs(json=) schema → `fo.Polylines` |
-| **Regression / scoring** | Add `"score"` task with structured_outputs(json=) numeric schema → `fo.Regression` |
-| **Content moderation** | Classify task with predefined NSFW/safety classes |
-| **Label verification** | Classify task comparing VLM output to existing labels |
-| **Hierarchical classification** | structured_outputs(json=) with multi-level schema |
+| **Keypoint estimation** | Add `"keypoint"` task → `fo.Keypoints` |
+| **Segmentation polygons** | Add `"segment"` task → `fo.Polylines` |
 | **Model auto-discovery** | Query `/v1/models` endpoint to populate model dropdown dynamically |
 
 ### Architectural hooks
@@ -1237,11 +1758,18 @@ Note: `vllm>=0.8.5` is required for the `StructuredOutputsParams` API used by th
 
 | Risk | Mitigation |
 |------|-----------|
-| vLLM not installed (offline mode) | Lazy import with clear error message; online mode still works |
-| Server unreachable (online mode) | Connection test before batch processing; clear error |
-| Model OOM (offline mode) | Expose `gpu_memory_utilization` and `max_model_len` in advanced settings |
-| Slow base64 encoding | ThreadPool parallelism; optional max image dimension resize |
-| `max_tokens` too low for JSON output | Document minimum recommended values per task; validate in resolve_input |
-| `structured_outputs` not supported by model/backend | Fallback to prompting-only mode with `json.loads()` attempt + raw text fallback |
-| Detection coordinate mismatch | Document 0-1000 convention; clamp values to [0, 1000] in parser |
-| Dataset too large for memory | Stream IDs/filepaths with batch iteration; never load all samples |
+| vLLM not installed (offline mode) | Lazy import with version floor check (≥0.16.0); UI shows error with install command before form completion; online mode works without vllm. Core `requirements.txt` omits vllm; `requirements-local.txt` provided for convenience |
+| Server unreachable (online mode) | `validate_connection()` before batch processing; query `/v1/models` |
+| Model OOM (offline mode) | Expose `gpu_memory_utilization`, `max_model_len`, device selection. Note: vLLM crashes at init if model can't fit — user must adjust settings |
+| Slow base64 encoding | ThreadPool parallelism with configurable `max_workers` |
+| `max_tokens` too low for JSON output | Affects all tasks (all use JSON schemas). Minimum recommended: 32 for classify, 64 for caption/vqa/ocr, 128 for tag, 256 for detect. Validate in resolve_input |
+| Structured output fails for a sample | No fallback to free-text parsing. Sample errors into `{field}_error` field. Silent degradation would produce unparseable data that violates the contract |
+| Detection coordinates out of range | Post-parse clamping to valid range; reject degenerate boxes |
+| `minItems`/`maxItems` ignored by xgrammar | Post-parse array length validation; schema kept for backends that support it |
+| Non-Qwen model for detection | Configurable `coordinate_format`; document model compatibility |
+| Individual sample parse failure | Per-sample try/except; errors stored in `{field}_error` field |
+| Event loop already running (FiftyOne App) | `_run_async()` detects existing loop, runs async code in dedicated thread |
+| Output field type conflict | `_field_conflict_check()` warns in UI before execution |
+| `file://` in offline mode | Use `image_pil` (PIL objects); `_resolve_image_mode()` overrides filepath→pil for offline |
+| Dataset too large for memory | Stream IDs/filepaths with batch iteration; never load all samples at once |
+| Model lacks chat template (LLaVA-1.5) | `chat_template` advanced setting accepts raw string or file path |

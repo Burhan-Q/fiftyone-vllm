@@ -4,5 +4,6 @@ version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
     "fiftyone>=1.13.2",
-    "vllm>=0.16.0",
+    "openai>=1.0",
+    "pillow>=9.0",
 ]

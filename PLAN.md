@@ -6,7 +6,7 @@ This plugin integrates vLLM with FiftyOne to provide universal VLM inference ove
 
 **Key principles**:
 
-1. **Structured output only**: All non-text outputs use vLLM's constrained generation (`guided_choice`, `guided_json`). Text parsing and fuzzy matching are never used.
+1. **Structured output only**: All non-text outputs use vLLM's constrained generation (`StructuredOutputsParams` with `choice` or `json`). Text parsing and fuzzy matching are never used.
 2. **vLLM handles chat templates**: The plugin always sends OpenAI-format messages. vLLM automatically applies the correct chat template per model.
 3. **Operates on FiftyOne datasets directly**: The operator works on `ctx.target_view()` (dataset, view, or selected samples) and writes results via `set_values()`.
 4. **Parallel everything**: ThreadPool for image encoding, async for online API calls, native batching for offline mode.
@@ -52,7 +52,7 @@ Separate `VLLMEngine` for inference, `TaskConfig` for prompts/structured output/
 |--------|-----------|
 | Image handling | Optimal -- file:// paths or parallel base64, no numpy |
 | Batch efficiency | High -- native vLLM batching, bulk set_values() writes |
-| Structured output | Full vLLM constrained generation (guided_choice, guided_json) |
+| Structured output | Full vLLM constrained generation (StructuredOutputsParams) |
 | Separation of concerns | Clean -- engine, task config, and operator each have one job |
 
 ### Cherry-Picked Elements
@@ -63,7 +63,7 @@ Separate `VLLMEngine` for inference, `TaskConfig` for prompts/structured output/
 | Design B | Reusable class external to operator | Engine can be used via SDK |
 | Design C | Parallel image prep + bulk writes | Maximum throughput |
 | Design C | File path-based image handling | Zero unnecessary image decoding |
-| vLLM | `guided_choice` + `guided_json` | Enforced structured output, zero text parsing |
+| vLLM | `StructuredOutputsParams(choice=..., json=...)` | Enforced structured output, zero text parsing |
 
 ---
 
@@ -125,9 +125,9 @@ The plugin supports 7 task types, selectable via a dropdown in the FiftyOne App.
 | Task | Description | vLLM Constraint | FiftyOne Output Type |
 |------|-------------|-----------------|---------------------|
 | **Caption** | Generate image description | None (free text) | `StringField` |
-| **Classify** | Single-label classification | `guided_choice` | `fo.Classification` |
-| **Tag** | Multi-label tagging | `guided_json` | `fo.Classifications` |
-| **Detect** | Object detection with bboxes | `guided_json` | `fo.Detections` |
+| **Classify** | Single-label classification | `structured_outputs(choice=)` | `fo.Classification` |
+| **Tag** | Multi-label tagging | `structured_outputs(json=)` | `fo.Classifications` |
+| **Detect** | Object detection with bboxes | `structured_outputs(json=)` | `fo.Detections` |
 | **VQA** | Visual question answering | None (free text) | `StringField` |
 | **OCR** | Extract text from image | None (free text) | `StringField` |
 | **Custom** | User-defined prompt | None (free text) | `StringField` |
@@ -146,7 +146,7 @@ The plugin supports 7 task types, selectable via a dropdown in the FiftyOne App.
 
 - **Default prompt**: `"Classify this image. Choose exactly one: {classes}"`
 - **System prompt**: `"You are an image classifier. Respond with exactly one class label."`
-- **Structured output**: `guided_choice=classes` — forces output to be exactly one of the class names
+- **Structured output**: `StructuredOutputsParams(choice=classes)` — forces output to be exactly one of the class names
 - **Output parse**: `fo.Classification(label=output_text.strip())`
 - **Additional inputs**: `classes` (required, comma-separated list)
 
@@ -154,7 +154,7 @@ The plugin supports 7 task types, selectable via a dropdown in the FiftyOne App.
 
 - **Default prompt**: `"Tag this image with all applicable labels from: {classes}"`
 - **System prompt**: `"You are an image tagger. Return a JSON object with a 'labels' array containing all applicable tags."`
-- **Structured output**: `guided_json` with schema:
+- **Structured output**: `StructuredOutputsParams(json=schema)` with schema:
 
 ```json
 {
@@ -176,7 +176,7 @@ The plugin supports 7 task types, selectable via a dropdown in the FiftyOne App.
 
 - **Default prompt**: `"Detect all objects in this image. For each object, return its label and bounding box as [x_min, y_min, x_max, y_max] in 0-1000 coordinates."` (If classes provided: `"Detect these objects: {classes}..."`)
 - **System prompt**: `"You are an object detector. Return a JSON object with a 'detections' array. Each detection has a 'label' string and 'box' array of [x_min, y_min, x_max, y_max] in 0-1000 coordinate space."`
-- **Structured output**: `guided_json` with schema:
+- **Structured output**: `StructuredOutputsParams(json=schema)` with schema:
 
 ```json
 {
@@ -239,16 +239,16 @@ The plugin supports 7 task types, selectable via a dropdown in the FiftyOne App.
 
 | Output type | Mechanism | Guarantee |
 |-------------|-----------|-----------|
-| Single label from fixed set | `guided_choice` | Output is exactly one of the allowed strings |
-| JSON object/array | `guided_json` | Output is valid JSON conforming to the schema |
+| Single label from fixed set | `structured_outputs(choice=)` | Output is exactly one of the allowed strings |
+| JSON object/array | `structured_outputs(json=)` | Output is valid JSON conforming to the schema |
 | Free text (captions, VQA, OCR) | No constraint | Stored as-is, no parsing needed |
 
 The only "parsing" performed is `json.loads()` on JSON that has been schema-enforced by vLLM's constrained generation. This is deterministic and cannot fail (barring truncation from insufficient `max_tokens`).
 
-**Engine mapping**:
+**Engine mapping** (vLLM 0.16+ `StructuredOutputsParams` API):
 
-- **Online mode**: `extra_body={"guided_choice": [...]}` or `extra_body={"guided_json": schema}`
-- **Offline mode**: `GuidedDecodingParams(choice=[...])` or `GuidedDecodingParams(json=schema)` passed to `SamplingParams`
+- **Online mode**: `extra_body={"structured_outputs": {"choice": [...]}}` or `extra_body={"structured_outputs": {"json": schema}}`
+- **Offline mode**: `StructuredOutputsParams(choice=[...])` or `StructuredOutputsParams(json=schema)` passed to `SamplingParams(structured_outputs=...)`
 
 ---
 
@@ -288,24 +288,30 @@ class VLLMEngine:
     def infer_batch(
         self,
         messages: list[list[dict]],
-        guided_choice: list[str] | None = None,
-        guided_json: dict | None = None,
+        structured_outputs: dict | None = None,
     ) -> list[str]:
         """Run batch inference with optional structured output constraints.
 
-        Exactly one of guided_choice or guided_json may be provided (or neither).
+        Args:
+            messages: list of OpenAI-format message lists, one per sample.
+            structured_outputs: optional dict passed to vLLM's
+                StructuredOutputsParams. Examples:
+                  {"choice": ["cat", "dog"]}
+                  {"json": {<JSON schema>}}
+                Pass None for free-text tasks.
+
         Returns list of response strings (plain text or valid JSON).
         """
         if self.mode == "online":
-            return self._online_batch(messages, guided_choice, guided_json)
-        return self._offline_batch(messages, guided_choice, guided_json)
+            return self._online_batch(messages, structured_outputs)
+        return self._offline_batch(messages, structured_outputs)
 
-    def _online_batch(self, messages, guided_choice, guided_json) -> list[str]:
+    def _online_batch(self, messages, structured_outputs) -> list[str]:
         """Async concurrent OpenAI API calls with semaphore for backpressure."""
         # Build extra_body from structured output params
         # extra_body = {}
-        # if guided_choice: extra_body["guided_choice"] = guided_choice
-        # if guided_json:   extra_body["guided_json"] = guided_json
+        # if structured_outputs:
+        #     extra_body["structured_outputs"] = structured_outputs
         #
         # sem = asyncio.Semaphore(self._max_concurrent)
         # async def _call(msgs):
@@ -320,19 +326,19 @@ class VLLMEngine:
         # return asyncio.run(asyncio.gather(*[_call(m) for m in messages]))
         ...
 
-    def _offline_batch(self, messages, guided_choice, guided_json) -> list[str]:
+    def _offline_batch(self, messages, structured_outputs) -> list[str]:
         """vLLM LLM.chat() native batch inference with structured output."""
         # from vllm import SamplingParams
-        # from vllm.sampling_params import GuidedDecodingParams
+        # from vllm.sampling_params import StructuredOutputsParams
         #
-        # guided = None
-        # if guided_choice: guided = GuidedDecodingParams(choice=guided_choice)
-        # if guided_json:   guided = GuidedDecodingParams(json=guided_json)
+        # so_params = None
+        # if structured_outputs:
+        #     so_params = StructuredOutputsParams(**structured_outputs)
         #
         # params = SamplingParams(
         #     temperature=self.temperature, max_tokens=self.max_tokens,
         #     top_p=self.top_p, seed=self.seed,
-        #     guided_decoding=guided,
+        #     structured_outputs=so_params,
         # )
         # outputs = self._llm.chat(messages, sampling_params=params)
         # return [o.outputs[0].text for o in outputs]
@@ -441,53 +447,61 @@ class TaskConfig:
         })
         return messages
 
-    # -- Structured output constraints --
+    # -- Structured output constraints (vLLM 0.16+ StructuredOutputsParams) --
 
-    def get_guided_choice(self) -> list[str] | None:
-        """Return guided_choice list for classify task, else None."""
+    def get_structured_outputs(self) -> dict | None:
+        """Return kwargs dict for StructuredOutputsParams, or None.
+
+        Used as:
+          - Online: extra_body={"structured_outputs": result}
+          - Offline: StructuredOutputsParams(**result) → SamplingParams(structured_outputs=...)
+        """
         if self.task == "classify" and self.classes:
-            return self.classes
-        return None
+            return {"choice": self.classes}
 
-    def get_guided_json(self) -> dict | None:
-        """Return JSON schema for tasks requiring guided_json, else None."""
         if self.task == "tag" and self.classes:
             return {
-                "type": "object",
-                "properties": {
-                    "labels": {
-                        "type": "array",
-                        "items": {"type": "string", "enum": self.classes},
-                    }
-                },
-                "required": ["labels"],
+                "json": {
+                    "type": "object",
+                    "properties": {
+                        "labels": {
+                            "type": "array",
+                            "items": {"type": "string", "enum": self.classes},
+                        }
+                    },
+                    "required": ["labels"],
+                }
             }
+
         if self.task == "detect":
             label_schema = {"type": "string"}
             if self.classes:
                 label_schema["enum"] = self.classes
             return {
-                "type": "object",
-                "properties": {
-                    "detections": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "label": label_schema,
-                                "box": {
-                                    "type": "array",
-                                    "items": {"type": "number"},
-                                    "minItems": 4,
-                                    "maxItems": 4,
+                "json": {
+                    "type": "object",
+                    "properties": {
+                        "detections": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "label": label_schema,
+                                    "box": {
+                                        "type": "array",
+                                        "items": {"type": "number"},
+                                        "minItems": 4,
+                                        "maxItems": 4,
+                                    },
                                 },
+                                "required": ["label", "box"],
                             },
-                            "required": ["label", "box"],
-                        },
-                    }
-                },
-                "required": ["detections"],
+                        }
+                    },
+                    "required": ["detections"],
+                }
             }
+
         return None
 
     # -- Output parsing --
@@ -606,7 +620,6 @@ class VLLMInference(foo.Operator):
             temperature=ctx.params.get("temperature", 0.0),
             max_tokens=ctx.params.get("max_tokens", 512),
             top_p=ctx.params.get("top_p", 1.0),
-            batch_size=ctx.params.get("batch_size", 32),
             # Offline-only
             tensor_parallel_size=ctx.params.get("tensor_parallel_size", 1),
             gpu_memory_utilization=ctx.params.get("gpu_memory_utilization", 0.9),
@@ -637,8 +650,7 @@ class VLLMInference(foo.Operator):
             output_field = ctx.params["output_field"]
 
             # Get structured output constraints from task
-            guided_choice = task.get_guided_choice()
-            guided_json = task.get_guided_json()
+            structured_outputs = task.get_structured_outputs()
 
             # 4. Process in batches
             processed = 0
@@ -659,8 +671,7 @@ class VLLMInference(foo.Operator):
                 # 4c. Batch inference with structured output
                 responses = engine.infer_batch(
                     batch_messages,
-                    guided_choice=guided_choice,
-                    guided_json=guided_json,
+                    structured_outputs=structured_outputs,
                 )
 
                 # 4d. Parse responses and bulk-write to dataset
@@ -1013,9 +1024,9 @@ Both `LLM.chat()` (offline) and `/v1/chat/completions` (online) automatically ap
 
 | Task | Constraint | Why no parsing needed |
 |------|-----------|----------------------|
-| Classify | `guided_choice=classes` | Output is exactly one class name |
-| Tag | `guided_json=schema` | Output is valid JSON with enum-constrained labels |
-| Detect | `guided_json=schema` | Output is valid JSON with label+box arrays |
+| Classify | `StructuredOutputsParams(choice=classes)` | Output is exactly one class name |
+| Tag | `StructuredOutputsParams(json=schema)` | Output is valid JSON with enum-constrained labels |
+| Detect | `StructuredOutputsParams(json=schema)` | Output is valid JSON with label+box arrays |
 | Caption/VQA/OCR/Custom | None | Output is free text, stored as-is |
 
 ### 8.3 Image Transfer Strategy
@@ -1083,8 +1094,7 @@ images = build_image_contents(filepaths, image_mode="base64")
 messages = [task.build_messages(img) for img in images]
 responses = engine.infer_batch(
     messages,
-    guided_choice=task.get_guided_choice(),
-    guided_json=task.get_guided_json(),
+    structured_outputs=task.get_structured_outputs(),
 )
 
 results = {sid: task.parse_response(r) for sid, r in zip(dataset.values("id"), responses)}
@@ -1101,22 +1111,21 @@ engine.cleanup()
 **Track A: `engine.py` + `utils.py`**
 
 1. `VLLMEngine.__init__()` for online mode (AsyncOpenAI client setup)
-2. `_online_batch()` with async concurrency, semaphore, `guided_choice` + `guided_json` via `extra_body`
+2. `_online_batch()` with async concurrency, semaphore, `structured_outputs` via `extra_body`
 3. `build_image_contents()` — filepath mode (string formatting, no I/O)
 4. `build_image_contents()` — base64 mode (ThreadPoolExecutor parallel I/O)
 5. `build_image_contents()` — auto-detection logic
 6. `VLLMEngine.__init__()` for offline mode (vLLM LLM instantiation, lazy import)
-7. `_offline_batch()` using `LLM.chat()` with `GuidedDecodingParams`
+7. `_offline_batch()` using `LLM.chat()` with `StructuredOutputsParams`
 8. `cleanup()` with GPU memory freeing
 
 **Track B: `tasks.py`**
 
 1. `TaskConfig.__init__()` with 7 task defaults and prompt template formatting
 2. `build_messages()` — OpenAI message format construction
-3. `get_guided_choice()` — returns constraint for classify task
-4. `get_guided_json()` — returns JSON schemas for tag and detect tasks
+3. `get_structured_outputs()` — returns `StructuredOutputsParams` kwargs for classify (choice), tag (json), detect (json)
 5. `parse_response()` for string output (caption, vqa, ocr, custom)
-6. `parse_response()` for Classification (classify — direct label from guided_choice)
+6. `parse_response()` for Classification (classify — direct label from structured choice)
 7. `parse_response()` for Classifications (tag — JSON parse to fo.Classifications)
 8. `parse_response()` for Detections (detect — JSON parse + coordinate conversion to fo.Detections)
 
@@ -1139,10 +1148,10 @@ engine.cleanup()
 
 ### Phase 3: Testing
 
-1. Online mode: classify task with guided_choice against a vLLM server
-2. Online mode: tag task with guided_json
+1. Online mode: classify task with structured_outputs(choice=) against a vLLM server
+2. Online mode: tag task with structured_outputs(json=)
 3. Online mode: caption task (free text)
-4. Online mode: detect task with guided_json
+4. Online mode: detect task with structured_outputs(json=)
 5. Offline mode: classify + tag + caption with local vLLM
 6. Progress reporting (immediate and delegated)
 7. Base64 vs filepath image modes
@@ -1186,11 +1195,11 @@ secrets:
 
 ```
 openai>=1.0
-vllm>=0.6.0
+vllm>=0.8.5
 pillow>=9.0
 ```
 
-Note: `vllm` is only required for offline mode. Online mode only needs `openai`. The plugin should handle the case where `vllm` is not installed and restrict to online-only mode with a clear message.
+Note: `vllm>=0.8.5` is required for the `StructuredOutputsParams` API used by this plugin. `vllm` is only required for offline mode. Online mode only needs `openai`. The plugin should handle the case where `vllm` is not installed and restrict to online-only mode with a clear message.
 
 ---
 
@@ -1198,7 +1207,7 @@ Note: `vllm` is only required for offline mode. Online mode only needs `openai`.
 
 | Feature | How Architecture Supports It |
 |---------|------------------------------|
-| **Structured JSON extraction** | Add a `"json_extract"` task to TaskConfig with user-provided JSON schema passed to `guided_json` |
+| **Structured JSON extraction** | Add a `"json_extract"` task to TaskConfig with user-provided JSON schema passed to `structured_outputs(json=)` |
 | **Multi-image per sample** | Extend `build_messages()` to accept multiple images per sample |
 | **Video understanding** | Add video frame extraction to utils; some VLMs support video inputs |
 | **Per-sample prompts from field** | Read prompt per-sample from a dataset field (e.g., `sample["question"]`) |
@@ -1208,17 +1217,17 @@ Note: `vllm` is only required for offline mode. Online mode only needs `openai`.
 | **FiftyOne Model Zoo** | Wrap VLLMEngine in `fo.Model` for `foz.load_zoo_model()` compat |
 | **Panel UI** | React panel for interactive VLM chat with selected images |
 | **Streaming responses** | vLLM streaming for interactive panel use |
-| **Keypoint estimation** | Add `"keypoint"` task with guided_json schema → `fo.Keypoints` |
-| **Segmentation polygons** | Add `"segment"` task with guided_json schema → `fo.Polylines` |
-| **Regression / scoring** | Add `"score"` task with guided_json numeric schema → `fo.Regression` |
+| **Keypoint estimation** | Add `"keypoint"` task with structured_outputs(json=) schema → `fo.Keypoints` |
+| **Segmentation polygons** | Add `"segment"` task with structured_outputs(json=) schema → `fo.Polylines` |
+| **Regression / scoring** | Add `"score"` task with structured_outputs(json=) numeric schema → `fo.Regression` |
 | **Content moderation** | Classify task with predefined NSFW/safety classes |
 | **Label verification** | Classify task comparing VLM output to existing labels |
-| **Hierarchical classification** | Guided_json with multi-level schema |
+| **Hierarchical classification** | structured_outputs(json=) with multi-level schema |
 | **Model auto-discovery** | Query `/v1/models` endpoint to populate model dropdown dynamically |
 
 ### Architectural hooks
 
-1. **TaskConfig is extensible**: New tasks add an entry to `TASKS`, a `get_guided_json()` branch, and a `parse_response()` branch. Engine and operator are untouched.
+1. **TaskConfig is extensible**: New tasks add an entry to `TASKS`, a `get_structured_outputs()` branch, and a `parse_response()` branch. Engine and operator are untouched.
 2. **VLLMEngine is mode-agnostic**: New vLLM features (LoRA, speculative decoding, quantization) only touch `engine.py`.
 3. **Operator UI is dynamic**: New parameters only require changes to the relevant helper function in `operators.py`.
 
@@ -1233,6 +1242,6 @@ Note: `vllm` is only required for offline mode. Online mode only needs `openai`.
 | Model OOM (offline mode) | Expose `gpu_memory_utilization` and `max_model_len` in advanced settings |
 | Slow base64 encoding | ThreadPool parallelism; optional max image dimension resize |
 | `max_tokens` too low for JSON output | Document minimum recommended values per task; validate in resolve_input |
-| `guided_json` not supported by model/backend | Fallback to prompting-only mode with `json.loads()` attempt + raw text fallback |
+| `structured_outputs` not supported by model/backend | Fallback to prompting-only mode with `json.loads()` attempt + raw text fallback |
 | Detection coordinate mismatch | Document 0-1000 convention; clamp values to [0, 1000] in parser |
 | Dataset too large for memory | Stream IDs/filepaths with batch iteration; never load all samples |

@@ -4,4 +4,5 @@ version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
     "fiftyone>=1.13.2",
+    "vllm>=0.16.0",
 ]

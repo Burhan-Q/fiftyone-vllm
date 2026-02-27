@@ -1,0 +1,12 @@
+name: "@fo-vllm/vllm"
+type: plugin
+author: "fo-vllm contributors"
+version: "0.1.0"
+description: "Universal VLM inference via vLLM — any model, any task, any scale"
+fiftyone:
+  version: ">=0.25"
+operators:
+  - run_vllm_inference
+secrets:
+  - FIFTYONE_VLLM_API_KEY
+  - FIFTYONE_VLLM_BASE_URL

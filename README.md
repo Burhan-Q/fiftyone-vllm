@@ -16,19 +16,42 @@ Or install locally:
 fiftyone plugins create /path/to/fo-vllm
 ```
 
+### Quick-start with Docker
+
+A `compose.yml` is included for launching a vLLM server:
+
+```shell
+# Set your HuggingFace token
+export HF_TOK=hf_...
+
+# Start vLLM with Qwen2.5-VL
+docker compose up -d
+```
+
+The default configuration serves `Qwen/Qwen2.5-VL-3B-Instruct-AWQ` on port 8811. Edit `compose.yml` to change the model, GPU memory utilization, or context length.
+
+## Architecture
+
+The plugin follows a **VLLMEngine + TaskConfig + Operator** design:
+
+- **`VLLMEngine`** (`engine.py`) — Async HTTP client wrapping vLLM's OpenAI-compatible API. Uses `AsyncOpenAI` with `asyncio.Semaphore` for concurrency control.
+- **`TaskConfig`** (`tasks.py`) — Prompt templates, JSON schema constraints, and output parsers for each task. Every task uses vLLM structured output (`StructuredOutputsParams`) to guarantee valid responses at the token level.
+- **`VLLMInference`** (`operators.py`) — Single FiftyOne operator that wires everything together: UI, batching, progress tracking, and result storage.
+- **`utils.py`** — Image loading/encoding utilities (base64 or file:// paths).
+
 ## Tasks
 
-| Task | Output | FiftyOne Type | Description |
-|------|--------|---------------|-------------|
-| **Caption** | text | `StringField` | Generate image descriptions |
-| **Classify** | single label | `fo.Classification` | Assign one class from a fixed set |
-| **Tag** | multiple labels | `fo.Classifications` | Assign multiple labels from a fixed set |
-| **Detect** | bounding boxes | `fo.Detections` | Locate objects with labels and boxes |
-| **VQA** | text | `StringField` | Answer a question about the image |
-| **OCR** | text | `StringField` | Extract visible text |
-| **Custom** | text | `StringField` | User-defined prompt |
+| Task | Output | FiftyOne Type | Structured Output |
+|------|--------|---------------|-------------------|
+| **Caption** | text description | `fo.Classification(label=text)` | `json: {"text": string}` |
+| **Classify** | single label | `fo.Classification(label=class)` | `choice: [classes]` |
+| **Tag** | multiple labels | `fo.Classifications` | `json: {"labels": [enum]}` |
+| **Detect** | bounding boxes | `fo.Detections` | `json: {"detections": [{label, box}]}` |
+| **VQA** | answer text | `fo.Classification(label=answer)` | `json: {"answer": string}` |
+| **OCR** | extracted text | `fo.Classification(label=text)` | `json: {"text": string}` |
+| **Custom** | free-form response | `fo.Classification(label=response)` | `json: {"response": string}` |
 
-All tasks use vLLM structured output (`StructuredOutputsParams`) to guarantee valid, parseable responses at the token level. There is no regex or free-text parsing anywhere in the plugin.
+All tasks return FiftyOne label types, which enables dynamic attribute attachment for metadata logging. There is no regex or free-text parsing anywhere in the plugin.
 
 ## Usage via the FiftyOne App
 
@@ -56,13 +79,12 @@ foo.execute_operator(
         "model": "Qwen/Qwen2.5-VL-7B-Instruct",
         "base_url": "http://localhost:8000/v1",
         "task": "caption",
-        "output_field": "caption",
     },
     dataset_name=dataset.name,
 )
 
-# Results are stored directly on each sample
-print(dataset.first().caption)
+# Results stored as fo.Classification on an auto-named field
+print(dataset.first().vllm_infer_caption.label)
 ```
 
 ### Classify images
@@ -75,13 +97,12 @@ foo.execute_operator(
         "base_url": "http://localhost:8000/v1",
         "task": "classify",
         "classes": "indoor, outdoor, aerial",
-        "output_field": "scene_type",
     },
     dataset_name="my-images",
 )
 
-# fo.Classification label
-print(dataset.first().scene_type.label)
+# fo.Classification label (constrained to one of the provided classes)
+print(dataset.first().vllm_infer_classification.label)
 ```
 
 ### Multi-label tagging
@@ -94,13 +115,12 @@ foo.execute_operator(
         "base_url": "http://localhost:8000/v1",
         "task": "tag",
         "classes": "person, vehicle, animal, building, nature, food",
-        "output_field": "scene_tags",
     },
     dataset_name="my-images",
 )
 
 # fo.Classifications with multiple labels
-for c in dataset.first().scene_tags.classifications:
+for c in dataset.first().vllm_infer_tags.classifications:
     print(c.label)
 ```
 
@@ -114,7 +134,6 @@ foo.execute_operator(
         "model": "Qwen/Qwen2.5-VL-7B-Instruct",
         "base_url": "http://localhost:8000/v1",
         "task": "detect",
-        "output_field": "detections",
     },
     dataset_name="my-images",
 )
@@ -127,7 +146,6 @@ foo.execute_operator(
         "base_url": "http://localhost:8000/v1",
         "task": "detect",
         "classes": "car, truck, bus, motorcycle, bicycle",
-        "output_field": "vehicle_detections",
     },
     dataset_name="my-images",
 )
@@ -143,10 +161,11 @@ foo.execute_operator(
         "base_url": "http://localhost:8000/v1",
         "task": "vqa",
         "question": "How many people are in this image?",
-        "output_field": "people_count",
     },
     dataset_name="my-images",
 )
+
+print(dataset.first().vllm_infer_vqa_answer.label)
 ```
 
 ### OCR
@@ -158,10 +177,11 @@ foo.execute_operator(
         "model": "Qwen/Qwen2.5-VL-7B-Instruct",
         "base_url": "http://localhost:8000/v1",
         "task": "ocr",
-        "output_field": "ocr_text",
     },
     dataset_name="my-images",
 )
+
+print(dataset.first().vllm_infer_ocr_text.label)
 ```
 
 ### Custom prompt
@@ -175,30 +195,11 @@ foo.execute_operator(
         "task": "custom",
         "prompt": "Is this image safe for work? Explain briefly.",
         "system_prompt": "You are a content moderator.",
-        "output_field": "moderation",
     },
     dataset_name="my-images",
 )
-```
 
-### Run on a filtered view
-
-```python
-dataset = fo.load_dataset("my-images")
-view = dataset.match(F("metadata.width") > 1000)
-
-foo.execute_operator(
-    "@fo-vllm/run_vllm_inference",
-    params={
-        "model": "Qwen/Qwen2.5-VL-7B-Instruct",
-        "base_url": "http://localhost:8000/v1",
-        "task": "caption",
-        "output_field": "caption",
-    },
-    dataset_name=dataset.name,
-    # The operator processes ctx.target_view(), which
-    # respects the current view set in the App or SDK
-)
+print(dataset.first().vllm_infer_vlm_output.label)
 ```
 
 ### Override the default prompt
@@ -213,7 +214,49 @@ foo.execute_operator(
         "base_url": "http://localhost:8000/v1",
         "task": "caption",
         "prompt_override": "Describe this image in exactly one sentence, focusing on the dominant colors.",
-        "output_field": "color_caption",
+    },
+    dataset_name="my-images",
+)
+```
+
+### Log run metadata
+
+Enable metadata logging to record model name, prompt, and inference config on each result:
+
+```python
+foo.execute_operator(
+    "@fo-vllm/run_vllm_inference",
+    params={
+        "model": "Qwen/Qwen2.5-VL-7B-Instruct",
+        "base_url": "http://localhost:8000/v1",
+        "task": "caption",
+        "log_metadata": True,
+    },
+    dataset_name="my-images",
+)
+
+# Dynamic attributes on each label
+label = dataset.first().vllm_infer_caption
+print(label.model_name)   # "Qwen/Qwen2.5-VL-7B-Instruct"
+print(label.prompt)        # "[system] ...\n[user] ..."
+print(label.infer_cfg)     # {"temperature": 0.2, "max_tokens": 512, ...}
+
+# Run metadata also stored at dataset level
+print(dataset.info["vllm_runs"]["vllm_infer_caption"])
+```
+
+### Overwrite previous results
+
+By default, running the same task creates a new field with an incremented suffix (`vllm_infer_caption`, `vllm_infer_caption1`, ...). To overwrite the most recent result instead:
+
+```python
+foo.execute_operator(
+    "@fo-vllm/run_vllm_inference",
+    params={
+        "model": "Qwen/Qwen2.5-VL-7B-Instruct",
+        "base_url": "http://localhost:8000/v1",
+        "task": "caption",
+        "overwrite_last": True,
     },
     dataset_name="my-images",
 )
@@ -224,6 +267,8 @@ foo.execute_operator(
 For advanced workflows outside the operator, use the engine and task config directly:
 
 ```python
+import fiftyone as fo
+
 from fo_vllm.engine import VLLMEngine
 from fo_vllm.tasks import TaskConfig
 from fo_vllm.utils import build_image_contents
@@ -237,7 +282,7 @@ engine = VLLMEngine(
 task = TaskConfig(task="classify", classes=["indoor", "outdoor"])
 
 filepaths = dataset.values("filepath")
-images = build_image_contents(filepaths, image_mode="base64")
+images = build_image_contents(filepaths, image_mode="auto")
 messages = [task.build_messages(img) for img in images]
 responses = engine.infer_batch(
     messages,
@@ -252,6 +297,22 @@ for sid, r in zip(dataset.values("id"), responses):
 
 dataset.set_values("scene_type", results, key_field="id")
 ```
+
+## Output field naming
+
+Results are stored as flat sample fields with auto-generated names based on the task's default field:
+
+| Task | Default field name |
+|------|-------------------|
+| caption | `vllm_infer_caption` |
+| classify | `vllm_infer_classification` |
+| tag | `vllm_infer_tags` |
+| detect | `vllm_infer_detections` |
+| vqa | `vllm_infer_vqa_answer` |
+| ocr | `vllm_infer_ocr_text` |
+| custom | `vllm_infer_vlm_output` |
+
+Subsequent runs of the same task auto-increment: `vllm_infer_caption`, `vllm_infer_caption1`, `vllm_infer_caption2`, etc. Enable "Overwrite last result" to re-use the most recent field instead.
 
 ## Configuration
 
@@ -270,28 +331,29 @@ Server settings can also be configured via FiftyOne secrets:
 
 Precedence: UI parameter > FiftyOne secret > default.
 
+Server settings are persisted in `dataset.info["_vllm_config"]` and restored as defaults on subsequent runs.
+
 ### Advanced settings
 
 Toggle "Show advanced settings" in the operator form to access these:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `temperature` | task-specific | Sampling temperature (0.0 for deterministic tasks, 0.2 for generative) |
+| `temperature` | task-specific | Sampling temperature (0.0 for deterministic tasks, 0.2 for generative). Leave empty for task default. |
 | `max_tokens` | 512 | Maximum tokens per response |
 | `top_p` | 1.0 | Nucleus sampling threshold |
-| `batch_size` | 32 | Samples per inference batch |
-| `max_concurrent` | 64 | Parallel HTTP requests to vLLM |
-| `max_workers` | 8 | Threads for image loading/encoding |
-| `image_mode` | auto | Image transfer method: `auto`, `base64`, or `filepath` |
+| `batch_size` | 8 | Samples per inference batch |
+| `max_concurrent` | 16 | Parallel HTTP requests to vLLM |
+| `max_workers` | 4 | Threads for image loading/encoding |
+| `image_mode` | auto | Image transfer method: `auto` or `filepath` |
 | `coordinate_format` | normalized_1000 | Detection coordinate convention (detect task only) |
 
 ### Image mode
 
 | Mode | When to use |
 |------|-------------|
-| `auto` | Default. Uses `filepath` for local servers, `base64` for remote. |
-| `filepath` | Local vLLM server with `--allowed-local-media-path`. Zero I/O overhead. |
-| `base64` | Remote servers or any setup. Images are base64-encoded in parallel. |
+| `auto` | Default. URLs pass through directly; local files are base64-encoded in parallel. |
+| `filepath` | Local vLLM server with `--allowed-local-media-path`. Sends `file://` URLs with zero I/O overhead. |
 
 ### Detection coordinate format
 
@@ -303,7 +365,11 @@ Different VLMs use different coordinate conventions for bounding boxes:
 | `normalized_1` | 0.0--1.0 | Some fine-tuned models |
 | `pixel` | 0--image_dim | InternVL, others |
 
-The plugin converts all formats to FiftyOne's `[x, y, w, h]` relative coordinates automatically.
+The plugin converts all formats to FiftyOne's `[x, y, w, h]` relative coordinates automatically. Post-generation validation catches degenerate boxes (zero or negative dimensions) and clamps coordinates to valid ranges.
+
+## Delegated execution
+
+The operator supports FiftyOne's delegated execution for long-running jobs. When launching from the App, choose "Delegate" to run the task in the background via a FiftyOne orchestrator. Progress is tracked via `ctx.set_progress()`.
 
 ## Compatible models
 
@@ -324,15 +390,17 @@ Chat templates are handled automatically by vLLM. For models without a built-in 
 
 ## Error handling
 
-- Per-sample errors are stored in `{output_field}_error` (e.g., `caption_error`)
+- Per-sample errors are stored in `{field_name}_error` (e.g., `vllm_infer_caption_error`)
 - A failed API call for one sample does not block the rest of the batch
-- The operator UI warns if the output field already exists with an incompatible type
-- Connection is validated before processing begins
+- Connection is validated before processing begins (`engine.validate_connection()`)
+- Detection post-validation silently drops malformed boxes (degenerate dimensions, wrong array length)
 
 ## Requirements
 
-- FiftyOne >= 0.25
+- Python >= 3.11
+- FiftyOne >= 1.13.2
 - `openai >= 1.0`
 - `pillow >= 9.0`
+- vLLM >= 0.16 (server-side, for `StructuredOutputsParams` support)
 
-No GPU or CUDA dependencies. All inference runs on the vLLM server.
+No GPU or CUDA dependencies on the client. All inference runs on the vLLM server.

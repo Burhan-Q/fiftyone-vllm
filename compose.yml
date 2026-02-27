@@ -17,4 +17,4 @@ services:
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
     ipc: host
-    command: --model Qwen/Qwen2.5-VL-3B-Instruct-AWQ --max-model-len 8192
+    command: --model Qwen/Qwen2.5-VL-3B-Instruct-AWQ --max-model-len 8192 --gpu-memory-utilization 0.6

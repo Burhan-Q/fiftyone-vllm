@@ -1,13 +1,22 @@
 """FiftyOne operator for vLLM inference: UI, batching, progress, and result
 storage."""
 
-import fiftyone as fo
 import fiftyone.operators as foo
 from fiftyone.operators import types
 
 from .engine import VLLMEngine
 from .tasks import TaskConfig
 from .utils import build_image_contents
+
+_DEFAULTS = {
+    "batch_size": 8,
+    "max_tokens": 512,
+    "top_p": 1.0,
+    "max_concurrent": 16,
+    "max_workers": 4,
+    "image_mode": "auto",
+    "coordinate_format": "normalized_1000",
+}
 
 
 class VLLMInference(foo.Operator):
@@ -31,13 +40,10 @@ class VLLMInference(foo.Operator):
         task = _task_selector(ctx, inputs)
         _task_settings(ctx, inputs, task)
         _output_settings(ctx, inputs, task)
-        _field_conflict_check(ctx, inputs, task)
         _advanced_settings(ctx, inputs)
         inputs.view_target(ctx)
 
-        return types.Property(
-            inputs, view=types.View(label="vLLM Inference")
-        )
+        return types.Property(inputs, view=types.View(label="vLLM Inference"))
 
     def resolve_delegation(self, ctx):
         return ctx.params.get("delegate", False)
@@ -45,64 +51,47 @@ class VLLMInference(foo.Operator):
     def execute(self, ctx):
         params = ctx.params
 
-        # 1. Resolve secrets with precedence:
-        #    UI param > FiftyOne secret > env > default
-        api_key = (
-            params.get("api_key")
-            or ctx.secrets.get("FIFTYONE_VLLM_API_KEY", None)
-            or "EMPTY"
-        )
-        base_url = (
-            params.get("base_url")
-            or ctx.secrets.get("FIFTYONE_VLLM_BASE_URL", None)
-            or "http://localhost:8000/v1"
-        )
+        engine, base_url, api_key = _create_engine(params, ctx.secrets)
+        task = _create_task(params)
 
-        # 2. Build engine
-        engine = VLLMEngine(
-            model=params["model"],
-            base_url=base_url,
-            api_key=api_key,
-            max_concurrent=params.get("max_concurrent", 64),
-            temperature=params.get("temperature", None),
-            max_tokens=params.get("max_tokens", 512),
-            top_p=params.get("top_p", 1.0),
-        )
-
-        # 3. Validate connection
-        engine.validate_connection()
-
-        # 4. Build task config
-        classes = None
-        raw_classes = params.get("classes")
-        if raw_classes:
-            classes = [c.strip() for c in raw_classes.split(",")]
-
-        task = TaskConfig(
-            task=params["task"],
-            prompt=params.get("prompt_override") or params.get("prompt"),
-            system_prompt=params.get("system_prompt"),
-            classes=classes,
-            coordinate_format=params.get(
-                "coordinate_format", "normalized_1000"
-            ),
-            question=params.get("question", ""),
-        )
-
-        # Apply task-specific temperature default if user didn't override
         if params.get("temperature") is None:
             engine.temperature = task.default_temperature
 
-        # 5. Get target samples
+        batch_size = params.get("batch_size", _DEFAULTS["batch_size"])
+        image_mode = params.get("image_mode", _DEFAULTS["image_mode"])
+
+        # 5. Get target samples and resolve output field
         view = ctx.target_view()
         ids = view.values("id")
         filepaths = view.values("filepath")
         total = len(ids)
-        batch_size = params.get("batch_size", 32)
-        output_field = params["output_field"]
-        max_workers = params.get("max_workers", 8)
+        max_workers = params.get("max_workers", _DEFAULTS["max_workers"])
 
         structured_outputs = task.get_structured_outputs()
+
+        # 5a. Resolve output field name (vllm_infer_caption, ...)
+        field_name = _resolve_field_name(
+            ctx.dataset,
+            params["task"],
+            params.get("overwrite_last", False),
+        )
+
+        # 5b. Build metadata for optional per-label logging
+        log_metadata = params.get("log_metadata", False)
+        full_prompt = ""
+        if task.system_prompt:
+            full_prompt += f"[system] {task.system_prompt}\n"
+        full_prompt += f"[user] {task.prompt}"
+
+        infer_cfg = {
+            "temperature": engine.temperature,
+            "max_tokens": engine.max_tokens,
+            "top_p": engine.top_p,
+            "batch_size": batch_size,
+            "coordinate_format": task.coordinate_format,
+            "image_mode": image_mode,
+            "max_concurrent": engine.max_concurrent,
+        }
 
         # 6. Process in batches
         processed = 0
@@ -115,15 +104,12 @@ class VLLMInference(foo.Operator):
             # 6a. Parallel image content construction
             image_contents = build_image_contents(
                 batch_paths,
-                image_mode=params.get("image_mode", "auto"),
-                base_url=base_url,
+                image_mode=image_mode,
                 max_workers=max_workers,
             )
 
             # 6b. Build messages for each image
-            batch_messages = [
-                task.build_messages(img) for img in image_contents
-            ]
+            batch_messages = [task.build_messages(img) for img in image_contents]
 
             # 6c. Batch inference with structured output
             responses = engine.infer_batch(
@@ -140,20 +126,23 @@ class VLLMInference(foo.Operator):
                     total_errors += 1
                     continue
                 try:
-                    results[sid] = task.parse_response(resp)
+                    label = task.parse_response(resp)
+                    if log_metadata:
+                        label.model_name = params["model"]
+                        label.prompt = full_prompt
+                        label.infer_cfg = infer_cfg
+                    results[sid] = label
                 except Exception as e:
                     errors[sid] = f"{type(e).__name__}: {e}"
                     total_errors += 1
 
-            # 6e. Bulk-write results and errors
-            if results:
-                ctx.dataset.set_values(
-                    output_field, results, key_field="id"
-                )
-            if errors:
-                ctx.dataset.set_values(
-                    f"{output_field}_error", errors, key_field="id"
-                )
+            # 6e. Bulk-write results and errors as flat fields
+            _write_batch_results(
+                ctx.dataset,
+                field_name,
+                results,
+                errors,
+            )
 
             # 6f. Progress
             processed += len(batch_ids)
@@ -169,15 +158,127 @@ class VLLMInference(foo.Operator):
                     dict(progress=processed / total, label=label),
                 )
 
-        # 7. Reload dataset in App
+        # 7. Persist run metadata and settings
+        if log_metadata:
+            runs = ctx.dataset.info.get("vllm_runs", {})
+            runs[field_name] = {
+                "model_name": params["model"],
+                "prompt": full_prompt,
+                "infer_cfg": infer_cfg,
+            }
+            ctx.dataset.info["vllm_runs"] = runs
+
+        ctx.dataset.info["_vllm_config"] = {
+            "model": params["model"],
+            "base_url": base_url,
+            "api_key": api_key,
+        }
+        ctx.dataset.save()
+
+        # 8. Reload dataset in App
         if not ctx.delegated:
             yield ctx.trigger("reload_dataset")
 
     def resolve_output(self, ctx):
         outputs = types.Object()
         outputs.str("summary", label="Summary")
-        return types.Property(
-            outputs, view=types.View(label="Complete")
+        return types.Property(outputs, view=types.View(label="Complete"))
+
+
+# -- Helpers --
+
+
+def _stored(ctx):
+    """Read persisted settings from dataset info."""
+    if not ctx.dataset:
+        return {}
+    return ctx.dataset.info.get("_vllm_config") or {}
+
+
+def _create_engine(params, secrets):
+    """Build and validate a VLLMEngine from operator params and secrets.
+
+    Returns (engine, base_url, api_key) — base_url/api_key needed for
+    dataset.info persistence.
+    """
+    api_key = (
+        params.get("api_key") or secrets.get("FIFTYONE_VLLM_API_KEY", None) or "EMPTY"
+    )
+    base_url = (
+        params.get("base_url")
+        or secrets.get("FIFTYONE_VLLM_BASE_URL", None)
+        or "http://localhost:8000/v1"
+    )
+
+    engine = VLLMEngine(
+        model=params["model"],
+        base_url=base_url,
+        api_key=api_key,
+        max_concurrent=params.get("max_concurrent", _DEFAULTS["max_concurrent"]),
+        temperature=params.get("temperature", None),
+        max_tokens=params.get("max_tokens", _DEFAULTS["max_tokens"]),
+        top_p=params.get("top_p", _DEFAULTS["top_p"]),
+    )
+    engine.validate_connection()
+
+    return engine, base_url, api_key
+
+
+def _create_task(params):
+    """Build a TaskConfig from operator params."""
+    classes = None
+    raw_classes = params.get("classes")
+    if raw_classes:
+        classes = [c.strip() for c in raw_classes.split(",")]
+
+    return TaskConfig(
+        task=params["task"],
+        prompt=params.get("prompt_override") or params.get("prompt"),
+        system_prompt=params.get("system_prompt"),
+        classes=classes,
+        coordinate_format=params.get(
+            "coordinate_format", _DEFAULTS["coordinate_format"]
+        ),
+        question=params.get("question", ""),
+    )
+
+
+def _resolve_field_name(dataset, task_name, overwrite=False):
+    """Resolve the output field name for a task run.
+
+    Produces: vllm_infer_task_name, vllm_infer_task_name1, ...
+    """
+    schema = dataset.get_field_schema(flat=True)
+    base = f"vllm_infer_{task_name}"
+
+    if base not in schema:
+        return base
+
+    n = 1
+    while f"{base}{n}" in schema:
+        n += 1
+
+    if overwrite:
+        return f"{base}{n - 1}" if n > 1 else base
+
+    return f"{base}{n}"
+
+
+def _write_batch_results(dataset, field_name, results, errors):
+    """Write a batch of results and errors as flat sample fields."""
+    if results:
+        dataset.set_values(
+            field_name,
+            results,
+            key_field="id",
+            dynamic=True,
+        )
+    if errors:
+        dataset.set_values(
+            f"{field_name}_error",
+            errors,
+            key_field="id",
+            dynamic=True,
         )
 
 
@@ -185,18 +286,18 @@ class VLLMInference(foo.Operator):
 
 
 def _model_selector(ctx, inputs):
+    stored = _stored(ctx)
     inputs.str(
         "model",
         label="Model",
         required=True,
-        description=(
-            "HuggingFace model ID"
-            " (e.g., Qwen/Qwen2.5-VL-7B-Instruct)"
-        ),
+        default=stored.get("model", ""),
+        description=("HuggingFace model ID (e.g., Qwen/Qwen2.5-VL-7B-Instruct)"),
     )
 
 
 def _server_settings(ctx, inputs):
+    stored = _stored(ctx)
     inputs.view(
         "server_header",
         types.Header(label="Server Settings", divider=True),
@@ -205,13 +306,13 @@ def _server_settings(ctx, inputs):
         "base_url",
         label="Server URL",
         required=True,
-        default="http://localhost:8000/v1",
+        default=stored.get("base_url", "http://localhost:8000/v1"),
         description="vLLM OpenAI-compatible API endpoint",
     )
     inputs.str(
         "api_key",
         label="API Key",
-        default="EMPTY",
+        default=stored.get("api_key", "EMPTY"),
         description="API key for authentication (use 'EMPTY' for no auth)",
     )
 
@@ -236,9 +337,7 @@ def _task_selector(ctx, inputs):
     task_dropdown.add_choice(
         "detect",
         label="Detect",
-        description=(
-            "Detect objects with bounding boxes (constrained JSON output)"
-        ),
+        description=("Detect objects with bounding boxes (constrained JSON output)"),
     )
     task_dropdown.add_choice(
         "vqa",
@@ -279,9 +378,7 @@ def _task_settings(ctx, inputs, task):
             "classes",
             label="Classes",
             required=True,
-            description=(
-                "Comma-separated class names (e.g., cat, dog, bird)"
-            ),
+            description=("Comma-separated class names (e.g., cat, dog, bird)"),
         )
     elif task == "detect":
         inputs.str(
@@ -326,48 +423,48 @@ def _task_settings(ctx, inputs, task):
 
 
 def _output_settings(ctx, inputs, task):
-    defaults = {t: v["default_field"] for t, v in TaskConfig.TASKS.items()}
-    inputs.str(
-        "output_field",
-        label="Output Field",
-        required=True,
-        default=defaults.get(task, "vlm_output"),
-        description="Field name to store results on each sample",
+    if not task or not ctx.dataset:
+        return
+
+    inputs.view(
+        "output_header",
+        types.Header(label="Output Settings", divider=True),
     )
 
+    schema = ctx.dataset.get_field_schema(flat=True)
+    base_field = f"vllm_infer_{task}"
+    has_existing = base_field in schema
 
-def _field_conflict_check(ctx, inputs, task):
-    """Check for field type conflicts and warn in the UI."""
-    output_field = ctx.params.get("output_field")
-    if not output_field or not ctx.dataset:
-        return
-
-    existing = ctx.dataset.get_field(output_field)
-    if existing is None:
-        return
-
-    expected_types = {
-        "caption": fo.StringField,
-        "classify": fo.EmbeddedDocumentField,
-        "tag": fo.EmbeddedDocumentField,
-        "detect": fo.EmbeddedDocumentField,
-        "vqa": fo.StringField,
-        "ocr": fo.StringField,
-        "custom": fo.StringField,
-    }
-    expected = expected_types.get(task)
-    if expected and not isinstance(existing, expected):
-        inputs.view(
-            "field_warning",
-            types.Warning(
-                label=(
-                    f"Field '{output_field}' already exists with type"
-                    f" {type(existing).__name__}. This task writes"
-                    f" {expected.__name__}. Choose a different field name"
-                    " to avoid conflicts."
-                )
-            ),
+    if has_existing:
+        inputs.bool(
+            "overwrite_last",
+            label="Overwrite last result",
+            default=False,
+            view=types.SwitchView(),
         )
+        overwrite = ctx.params.get("overwrite_last", False)
+        resolved = _resolve_field_name(ctx.dataset, task, overwrite)
+        prefix = "Overwriting" if overwrite else "Writing to"
+        inputs.view(
+            "field_info",
+            types.Notice(label=f"{prefix}: {resolved}"),
+        )
+    else:
+        inputs.view(
+            "field_info",
+            types.Notice(label=f"Writing to: {base_field}"),
+        )
+
+    inputs.bool(
+        "log_metadata",
+        label="Log run metadata",
+        default=False,
+        view=types.SwitchView(),
+        description=(
+            "Store model name, prompt, and inference config"
+            " on each result label and in dataset info"
+        ),
+    )
 
 
 def _advanced_settings(ctx, inputs):
@@ -390,15 +487,12 @@ def _advanced_settings(ctx, inputs):
         default=None,
         min=0.0,
         max=2.0,
-        description=(
-            "Sampling temperature"
-            " (leave empty for task-specific default)"
-        ),
+        description=("Sampling temperature (leave empty for task-specific default)"),
     )
     inputs.int(
         "max_tokens",
         label="Max Tokens",
-        default=512,
+        default=_DEFAULTS["max_tokens"],
         min=1,
         max=4096,
         description="Maximum tokens to generate per sample",
@@ -406,14 +500,14 @@ def _advanced_settings(ctx, inputs):
     inputs.float(
         "top_p",
         label="Top P",
-        default=1.0,
+        default=_DEFAULTS["top_p"],
         min=0.0,
         max=1.0,
     )
     inputs.int(
         "batch_size",
         label="Batch Size",
-        default=32,
+        default=_DEFAULTS["batch_size"],
         min=1,
         max=512,
         description="Number of samples per inference batch",
@@ -422,7 +516,7 @@ def _advanced_settings(ctx, inputs):
     inputs.int(
         "max_concurrent",
         label="Max Concurrent Requests",
-        default=64,
+        default=_DEFAULTS["max_concurrent"],
         min=1,
         max=256,
         description="Maximum parallel HTTP requests to vLLM server",
@@ -430,37 +524,29 @@ def _advanced_settings(ctx, inputs):
     inputs.int(
         "max_workers",
         label="Image Loading Workers",
-        default=8,
+        default=_DEFAULTS["max_workers"],
         min=1,
         max=32,
-        description=(
-            "Thread pool size for parallel image loading/encoding"
-        ),
+        description=("Thread pool size for parallel image loading/encoding"),
     )
 
     image_dropdown = types.Dropdown()
     image_dropdown.add_choice(
         "auto",
-        label="Auto",
-        description="Best option based on server location",
-    )
-    image_dropdown.add_choice(
-        "base64",
-        label="Base64",
-        description="Base64-encoded (works everywhere)",
+        label="Auto (Recommended)",
+        description="URLs passed through, local files base64-encoded",
     )
     image_dropdown.add_choice(
         "filepath",
         label="File Path",
         description=(
-            "file:// paths (local servers with"
-            " --allowed-local-media-path)"
+            "file:// paths (local vLLM server with --allowed-local-media-path only)"
         ),
     )
     inputs.enum(
         "image_mode",
         image_dropdown.values(),
-        default="auto",
+        default=_DEFAULTS["image_mode"],
         label="Image Mode",
         view=image_dropdown,
     )
@@ -468,22 +554,14 @@ def _advanced_settings(ctx, inputs):
     task = ctx.params.get("task")
     if task == "detect":
         coord_dropdown = types.Dropdown()
-        coord_dropdown.add_choice(
-            "normalized_1000", label="0-1000 (Qwen default)"
-        )
-        coord_dropdown.add_choice(
-            "normalized_1", label="0-1 (relative)"
-        )
-        coord_dropdown.add_choice(
-            "pixel", label="Pixel coordinates"
-        )
+        coord_dropdown.add_choice("normalized_1000", label="0-1000 (Qwen default)")
+        coord_dropdown.add_choice("normalized_1", label="0-1 (relative)")
+        coord_dropdown.add_choice("pixel", label="Pixel coordinates")
         inputs.enum(
             "coordinate_format",
             coord_dropdown.values(),
-            default="normalized_1000",
+            default=_DEFAULTS["coordinate_format"],
             label="Coordinate Format",
             view=coord_dropdown,
-            description=(
-                "Bounding box coordinate convention used by the model"
-            ),
+            description=("Bounding box coordinate convention used by the model"),
         )

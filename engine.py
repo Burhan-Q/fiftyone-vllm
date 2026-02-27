@@ -12,7 +12,7 @@ class VLLMEngine:
         model,
         base_url="http://localhost:8000/v1",
         api_key="EMPTY",
-        max_concurrent=64,
+        max_concurrent=16,
         temperature=0.0,
         max_tokens=512,
         top_p=1.0,
@@ -27,17 +27,16 @@ class VLLMEngine:
         self.max_tokens = max_tokens
         self.top_p = top_p
         self.seed = seed
-        self._max_concurrent = max_concurrent
+        self.max_concurrent = max_concurrent
         self._aclient = AsyncOpenAI(base_url=base_url, api_key=api_key)
 
     def list_models(self):
         """Query available models from the vLLM server."""
-        from openai import OpenAI
+        if not hasattr(self, "_sync_client"):
+            from openai import OpenAI
 
-        sync_client = OpenAI(
-            base_url=self.base_url, api_key=self.api_key
-        )
-        return [m.id for m in sync_client.models.list().data]
+            self._sync_client = OpenAI(base_url=self.base_url, api_key=self.api_key)
+        return [m.id for m in self._sync_client.models.list().data]
 
     def validate_connection(self):
         """Test server connectivity. Raises on failure."""
@@ -58,13 +57,11 @@ class VLLMEngine:
         Returns list of response strings (valid JSON or choice-constrained
         string).
         """
-        return _run_async(
-            self._async_infer_batch(messages, structured_outputs)
-        )
+        return _run_async(self._async_infer_batch(messages, structured_outputs))
 
     async def _async_infer_batch(self, messages, structured_outputs):
         extra_body = {"structured_outputs": structured_outputs}
-        sem = asyncio.Semaphore(self._max_concurrent)
+        sem = asyncio.Semaphore(self.max_concurrent)
 
         async def _call(msgs):
             async with sem:

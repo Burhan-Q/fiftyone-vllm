@@ -6,46 +6,45 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 
 
-def build_image_contents(
-    filepaths,
-    image_mode="auto",
-    base_url=None,
-    max_workers=8,
-):
+def build_image_contents(filepaths, image_mode="auto", max_workers=4):
     """Build image content dicts for vLLM chat messages.
 
-    Returns OpenAI-format image_url content dicts. All I/O-bound
-    work is parallelized via ThreadPoolExecutor.
+    URLs (http/https) are always passed through directly.
+    Local files are base64-encoded by default, or sent as file:// URLs
+    in "filepath" mode (requires --allowed-local-media-path on the
+    vLLM server).
 
     Args:
-        filepaths: absolute paths to image files.
-        image_mode: "auto" | "base64" | "filepath"
-            - "auto": filepath for local servers; base64 for remote
-            - "filepath": file:// URL strings (local servers only, no I/O)
-            - "base64": base64 data URIs (works everywhere, parallel I/O)
-        base_url: vLLM server URL, used by "auto" to detect local servers.
-        max_workers: ThreadPoolExecutor size for parallel encoding.
+        filepaths: paths or URLs to image files.
+        image_mode: "auto" | "filepath"
+            - "auto": URLs pass through, local files base64-encoded
+            - "filepath": URLs pass through, local files as file:// URLs
+        max_workers: ThreadPoolExecutor size for parallel base64 encoding.
     """
-    resolved = _resolve_image_mode(image_mode, base_url)
+    results = [None] * len(filepaths)
+    to_encode = []
 
-    if resolved == "filepath":
-        return [_filepath_content(fp) for fp in filepaths]
-    elif resolved == "base64":
+    for i, fp in enumerate(filepaths):
+        if fp.startswith(("http://", "https://")):
+            results[i] = _url_content(fp)
+        elif image_mode == "filepath":
+            results[i] = _filepath_content(fp)
+        else:
+            to_encode.append(i)
+
+    if to_encode:
+        paths = [filepaths[i] for i in to_encode]
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            return list(pool.map(_encode_base64, filepaths))
-    else:
-        raise ValueError(f"Unknown image mode: {resolved}")
+            encoded = list(pool.map(_encode_base64, paths))
+        for idx, enc in zip(to_encode, encoded):
+            results[idx] = enc
+
+    return results
 
 
-def _resolve_image_mode(image_mode, base_url):
-    """Resolve the effective image mode from user settings and context."""
-    if image_mode != "auto":
-        return image_mode
-    if base_url and any(
-        h in base_url for h in ("localhost", "127.0.0.1", "0.0.0.0")
-    ):
-        return "filepath"
-    return "base64"
+def _url_content(url):
+    """Wrap an HTTP(S) URL as an image_url content dict."""
+    return {"type": "image_url", "image_url": {"url": url}}
 
 
 def _filepath_content(filepath):

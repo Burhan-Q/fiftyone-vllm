@@ -18,3 +18,4 @@ services:
       - ~/.cache/huggingface:/root/.cache/huggingface
     ipc: host
     command: --model Qwen/Qwen2.5-VL-3B-Instruct-AWQ --max-model-len 8192 --gpu-memory-utilization 0.6
+    # command: --model google/gemma-3-4b-it --max-model-len 8192 --gpu-memory-utilization 0.6  # NOTE: must agree to access repo

@@ -77,6 +77,12 @@ class TaskConfig:
         },
     }
 
+    _BOX_FORMATS = {
+        "xyxy": {"labels": "[x_min, y_min, x_max, y_max]"},
+        "xywh": {"labels": "[x, y, width, height]"},
+        "cxcywh": {"labels": "[cx, cy, width, height]"},
+    }
+
     _COORD_FORMATS = {
         "normalized_1000": {
             "desc": (
@@ -113,6 +119,7 @@ class TaskConfig:
         system_prompt=None,
         classes=None,
         coordinate_format="normalized_1000",
+        box_format="xyxy",
         **template_kwargs,
     ):
         if task not in self.TASKS:
@@ -125,23 +132,29 @@ class TaskConfig:
         self.default_field = defaults["default_field"]
         self.default_temperature = defaults["default_temperature"]
         self.coordinate_format = coordinate_format
+        self.box_format = box_format
 
         if task == "detect":
             coord = self._COORD_FORMATS.get(
                 coordinate_format, self._COORD_FORMATS["normalized_1000"]
             )
             coord_desc = coord["desc"]
+            box_fmt = self._BOX_FORMATS.get(box_format, self._BOX_FORMATS["xyxy"])
+            box_labels = box_fmt["labels"]
 
             default_system = (
                 "You are an object detector. Respond with a JSON object:"
-                ' {"detections": [{"label": "...", "box": [x_min, y_min,'
-                " x_max, y_max]}, ...]}. Use " + coord_desc + "."
+                ' {"detections": [{"label": "...", "box": '
+                + box_labels
+                + "}, ...]}. Use "
+                + coord_desc
+                + "."
             )
             default_prompt = "Detect all objects in this image."
             default_prompt_with_classes = (
                 "Detect these objects in this image: {classes}."
                 " For each object, return its label and bounding box"
-                " as [x_min, y_min, x_max, y_max] in " + coord_desc + "."
+                " as " + box_labels + " in " + coord_desc + "."
             )
         else:
             default_system = defaults.get("system", "")
@@ -267,7 +280,7 @@ class TaskConfig:
 
     # -- Output parsing (all responses are structured) --
 
-    def parse_response(self, text):
+    def parse_response(self, text, image_width=None, image_height=None):
         """Parse VLM response into a FiftyOne label.
 
         All responses are structured: either JSON from json= constraint
@@ -276,6 +289,12 @@ class TaskConfig:
 
         Every task returns a label type (Classification, Classifications,
         or Detections), enabling dynamic attributes for metadata.
+
+        Args:
+            text: raw VLM response string.
+            image_width: pixel width of the source image (needed for
+                pixel coordinate normalization in detection tasks).
+            image_height: pixel height of the source image.
         """
         if self.output_type == "Classification":
             if self.task in self._STRING_KEYS:
@@ -294,11 +313,13 @@ class TaskConfig:
             )
 
         if self.output_type == "Detections":
-            return self._parse_detections(data)
+            return self._parse_detections(
+                data, image_width=image_width, image_height=image_height
+            )
 
         raise ValueError(f"Unknown output type: {self.output_type}")
 
-    def _parse_detections(self, data):
+    def _parse_detections(self, data, image_width=None, image_height=None):
         """Post-generation validation for detection output.
 
         The JSON structure is guaranteed by the schema constraint.
@@ -313,7 +334,13 @@ class TaskConfig:
             if len(box) != 4:
                 continue
 
-            result = _convert_box(*[float(v) for v in box], self.coordinate_format)
+            result = _convert_box(
+                *[float(v) for v in box],
+                coordinate_format=self.coordinate_format,
+                box_format=self.box_format,
+                img_w=image_width,
+                img_h=image_height,
+            )
             if result is None:
                 continue
 
@@ -334,28 +361,51 @@ class TaskConfig:
         return fo.Detections(detections=detections)
 
 
-_COORD_MAX = {"normalized_1000": 1000.0, "normalized_1": 1.0}
+_COORD_SCALE = {"normalized_1000": 1000.0, "normalized_1": 1.0}
 
 
-def _convert_box(x1, y1, x2, y2, coordinate_format):
-    """Convert [x1,y1,x2,y2] to FiftyOne [x,y,w,h] in [0,1].
+def _convert_box(
+    v0, v1, v2, v3, coordinate_format, box_format="xyxy", img_w=None, img_h=None
+):
+    """Convert model box output to FiftyOne [x, y, w, h] in [0, 1].
 
-    Returns None if degenerate.
+    Two-step pipeline:
+      A. Convert from model box_format to internal xyxy.
+      B. Normalize to [0, 1] based on coordinate_format.
+
+    Returns None if degenerate or missing required dimensions.
     """
-    coord_max = _COORD_MAX.get(coordinate_format)
-    if coord_max is not None:
-        x1 = max(0.0, min(x1, coord_max))
-        y1 = max(0.0, min(y1, coord_max))
-        x2 = max(0.0, min(x2, coord_max))
-        y2 = max(0.0, min(y2, coord_max))
-        if x2 <= x1 or y2 <= y1:
+    # Step A: convert to xyxy
+    if box_format == "xywh":
+        x1, y1, x2, y2 = v0, v1, v0 + v2, v1 + v3
+    elif box_format == "cxcywh":
+        x1, y1, x2, y2 = v0 - v2 / 2, v1 - v3 / 2, v0 + v2 / 2, v1 + v3 / 2
+    else:  # xyxy
+        x1, y1, x2, y2 = v0, v1, v2, v3
+
+    # Step B: resolve per-axis scale and normalize to [0, 1] xywh
+    scale = _COORD_SCALE.get(coordinate_format)
+    if scale is not None:
+        max_x = max_y = scale
+    elif coordinate_format == "pixel":
+        if img_w is None or img_h is None:
+            logger.warning("Pixel coordinates require image dimensions; skipping box")
             return None
-        x = x1 / coord_max
-        y = y1 / coord_max
-        w = min((x2 - x1) / coord_max, 1.0 - x)
-        h = min((y2 - y1) / coord_max, 1.0 - y)
+        max_x, max_y = float(img_w), float(img_h)
     else:
+        # Unknown format fallback — no normalization
         if x2 <= x1 or y2 <= y1:
             return None
-        x, y, w, h = x1, y1, x2 - x1, y2 - y1
+        return x1, y1, x2 - x1, y2 - y1
+
+    x1 = max(0.0, min(x1, max_x))
+    y1 = max(0.0, min(y1, max_y))
+    x2 = max(0.0, min(x2, max_x))
+    y2 = max(0.0, min(y2, max_y))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    x = x1 / max_x
+    y = y1 / max_y
+    w = min((x2 - x1) / max_x, 1.0 - x)
+    h = min((y2 - y1) / max_y, 1.0 - y)
     return x, y, w, h

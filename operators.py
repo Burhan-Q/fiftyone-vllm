@@ -16,6 +16,7 @@ _DEFAULTS = {
     "max_workers": 4,
     "image_mode": "auto",
     "coordinate_format": "normalized_1000",
+    "box_format": "xyxy",
 }
 
 
@@ -89,9 +90,20 @@ class VLLMInference(foo.Operator):
             "top_p": engine.top_p,
             "batch_size": batch_size,
             "coordinate_format": task.coordinate_format,
+            "box_format": task.box_format,
             "image_mode": image_mode,
             "max_concurrent": engine.max_concurrent,
         }
+
+        # 5c. Collect image dimensions for pixel coordinate normalization
+        need_dims = task.task == "detect" and task.coordinate_format == "pixel"
+        if need_dims:
+            view.compute_metadata()
+            widths = view.values("metadata.width")
+            heights = view.values("metadata.height")
+        else:
+            widths = [None] * total
+            heights = [None] * total
 
         # 6. Process in batches
         processed = 0
@@ -100,6 +112,8 @@ class VLLMInference(foo.Operator):
         for i in range(0, total, batch_size):
             batch_ids = ids[i : i + batch_size]
             batch_paths = filepaths[i : i + batch_size]
+            batch_widths = widths[i : i + batch_size]
+            batch_heights = heights[i : i + batch_size]
 
             # 6a. Parallel image content construction
             image_contents = build_image_contents(
@@ -120,13 +134,17 @@ class VLLMInference(foo.Operator):
             # 6d. Parse responses with per-sample error handling
             results = {}
             errors = {}
-            for sid, resp in zip(batch_ids, responses):
+            for sid, resp, img_w, img_h in zip(
+                batch_ids, responses, batch_widths, batch_heights
+            ):
                 if isinstance(resp, Exception):
                     errors[sid] = f"{type(resp).__name__}: {resp}"
                     total_errors += 1
                     continue
                 try:
-                    label = task.parse_response(resp)
+                    label = task.parse_response(
+                        resp, image_width=img_w, image_height=img_h
+                    )
                     if log_metadata:
                         label.model_name = params["model"]
                         label.prompt = full_prompt
@@ -239,6 +257,7 @@ def _create_task(params):
         coordinate_format=params.get(
             "coordinate_format", _DEFAULTS["coordinate_format"]
         ),
+        box_format=params.get("box_format", _DEFAULTS["box_format"]),
         question=params.get("question", ""),
     )
 
@@ -564,4 +583,17 @@ def _advanced_settings(ctx, inputs):
             label="Coordinate Format",
             view=coord_dropdown,
             description=("Bounding box coordinate convention used by the model"),
+        )
+
+        box_dropdown = types.Dropdown()
+        box_dropdown.add_choice("xyxy", label="xyxy — corners")
+        box_dropdown.add_choice("xywh", label="xywh — origin + size")
+        box_dropdown.add_choice("cxcywh", label="cxcywh — center + size")
+        inputs.enum(
+            "box_format",
+            box_dropdown.values(),
+            default=_DEFAULTS["box_format"],
+            label="Box Format",
+            view=box_dropdown,
+            description="Bounding box format produced by the model",
         )

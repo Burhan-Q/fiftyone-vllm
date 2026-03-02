@@ -29,10 +29,11 @@ class VLLMEngine:
         self.seed = seed
         self.max_concurrent = max_concurrent
         self._aclient = AsyncOpenAI(base_url=base_url, api_key=api_key)
+        self._sync_client = None
 
     def list_models(self):
         """Query available models from the vLLM server."""
-        if not hasattr(self, "_sync_client"):
+        if self._sync_client is None:
             from openai import OpenAI
 
             self._sync_client = OpenAI(base_url=self.base_url, api_key=self.api_key)

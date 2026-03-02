@@ -36,8 +36,13 @@ class VLLMInference(foo.Operator):
     def resolve_input(self, ctx):
         inputs = types.Object()
 
-        _model_selector(ctx, inputs)
-        _server_settings(ctx, inputs)
+        if not ctx.dataset:
+            inputs.view("error", types.Error(label="No dataset loaded"))
+            return types.Property(inputs)
+
+        stored = _stored(ctx)
+        _model_selector(ctx, inputs, stored)
+        _server_settings(ctx, inputs, stored)
         task = _task_selector(ctx, inputs)
         _task_settings(ctx, inputs, task)
         _output_settings(ctx, inputs, task)
@@ -79,23 +84,35 @@ class VLLMInference(foo.Operator):
 
         # 5b. Build metadata for optional per-label logging
         log_metadata = params.get("log_metadata", False)
-        full_prompt = ""
-        if task.system_prompt:
-            full_prompt += f"[system] {task.system_prompt}\n"
-        full_prompt += f"[user] {task.prompt}"
+        if log_metadata:
+            full_prompt = ""
+            if task.system_prompt:
+                full_prompt += f"[system] {task.system_prompt}\n"
+            full_prompt += f"[user] {task.prompt}"
 
-        infer_cfg = {
-            "temperature": engine.temperature,
-            "max_tokens": engine.max_tokens,
-            "top_p": engine.top_p,
-            "batch_size": batch_size,
-            "coordinate_format": task.coordinate_format,
-            "box_format": task.box_format,
-            "image_mode": image_mode,
-            "max_concurrent": engine.max_concurrent,
-        }
+            infer_cfg = {
+                "temperature": engine.temperature,
+                "max_tokens": engine.max_tokens,
+                "top_p": engine.top_p,
+                "batch_size": batch_size,
+                "coordinate_format": task.coordinate_format,
+                "box_format": task.box_format,
+                "image_mode": image_mode,
+                "max_concurrent": engine.max_concurrent,
+            }
 
-        # 5c. Collect image dimensions for pixel coordinate normalization
+        # 5c. Clear stale error fields when overwriting
+        if params.get("overwrite_last", False):
+            error_field = f"{field_name}_error"
+            schema = ctx.dataset.get_field_schema(flat=True)
+            if error_field in schema:
+                ctx.dataset.set_values(
+                    error_field,
+                    {sid: None for sid in ids},
+                    key_field="id",
+                )
+
+        # 5d. Collect image dimensions for pixel coordinate normalization
         need_dims = task.task == "detect" and task.coordinate_format == "pixel"
         if need_dims:
             view.compute_metadata()
@@ -236,6 +253,7 @@ def _create_engine(params, secrets):
         temperature=params.get("temperature", None),
         max_tokens=params.get("max_tokens", _DEFAULTS["max_tokens"]),
         top_p=params.get("top_p", _DEFAULTS["top_p"]),
+        seed=params.get("seed", None),
     )
     engine.validate_connection()
 
@@ -304,8 +322,7 @@ def _write_batch_results(dataset, field_name, results, errors):
 # -- UI helper functions --
 
 
-def _model_selector(ctx, inputs):
-    stored = _stored(ctx)
+def _model_selector(ctx, inputs, stored):
     inputs.str(
         "model",
         label="Model",
@@ -315,8 +332,7 @@ def _model_selector(ctx, inputs):
     )
 
 
-def _server_settings(ctx, inputs):
-    stored = _stored(ctx)
+def _server_settings(ctx, inputs, stored):
     inputs.view(
         "server_header",
         types.Header(label="Server Settings", divider=True),
@@ -522,6 +538,12 @@ def _advanced_settings(ctx, inputs):
         default=_DEFAULTS["top_p"],
         min=0.0,
         max=1.0,
+    )
+    inputs.int(
+        "seed",
+        label="Seed",
+        default=None,
+        description="Random seed for reproducible results (leave empty for non-deterministic)",
     )
     inputs.int(
         "batch_size",

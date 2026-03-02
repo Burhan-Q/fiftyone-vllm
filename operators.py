@@ -1,14 +1,26 @@
 """FiftyOne operator for vLLM inference: UI, batching, progress, and result
 storage."""
 
+import json
+
 import fiftyone.operators as foo
 from fiftyone.operators import types
 
 from .engine import VLLMEngine
 from .tasks import TaskConfig
-from .utils import build_image_contents
+from .utils import (
+    build_image_contents,
+    clear_global_config,
+    get_global_config,
+    normalize_classes,
+    parse_config_json,
+    pick_params,
+    save_global_config,
+)
 
 _DEFAULTS = {
+    "base_url": "http://localhost:8000/v1",
+    "api_key": "EMPTY",
     "batch_size": 8,
     "max_tokens": 512,
     "top_p": 1.0,
@@ -40,14 +52,87 @@ class VLLMInference(foo.Operator):
             inputs.view("error", types.Error(label="No dataset loaded"))
             return types.Property(inputs)
 
-        stored = _stored(ctx)
-        _model_selector(ctx, inputs, stored)
-        _server_settings(ctx, inputs, stored)
-        task = _task_selector(ctx, inputs)
-        _task_settings(ctx, inputs, task)
-        _output_settings(ctx, inputs, task)
-        _advanced_settings(ctx, inputs)
-        inputs.view_target(ctx)
+        stored = _resolve_config(ctx)
+
+        # Config mode selector
+        mode_radio = types.RadioGroup(orientation="horizontal")
+        mode_radio.add_choice("manual", label="Configure manually")
+        mode_radio.add_choice("json", label="Paste JSON config")
+        mode_radio.add_choice("reset", label="Reset to defaults")
+        inputs.enum(
+            "config_mode",
+            mode_radio.values(),
+            default="manual",
+            label="Configuration",
+            view=mode_radio,
+        )
+        config_mode = ctx.params.get("config_mode", "manual")
+
+        if config_mode == "json":
+            inputs.str(
+                "config_json",
+                label="Paste JSON Config",
+                required=True,
+                description="Paste a config exported from a previous run",
+                view=types.CodeView(language="json"),
+            )
+            inputs.bool(
+                "show_params",
+                label="Show accepted parameters",
+                default=False,
+                view=types.SwitchView(),
+            )
+            if ctx.params.get("show_params"):
+                inputs.md(
+                    "**Server:** `model`, `base_url`\n\n"
+                    "**Task:** `task`, `classes`, `question`, `prompt`, "
+                    "`system_prompt`, `prompt_override`\n\n"
+                    "**Advanced:** `temperature`, `max_tokens`, `top_p`, "
+                    "`seed`, `batch_size`, `max_concurrent`, `max_workers`, "
+                    "`image_mode`, `coordinate_format`, `box_format`",
+                    name="params_ref",
+                )
+            raw = ctx.params.get("config_json")
+            if raw:
+                cfg, err = parse_config_json(raw)
+                if err:
+                    inputs.view("json_err", types.Error(label=err))
+                else:
+                    missing = [k for k in ("model", "task") if not cfg.get(k)]
+                    if cfg.get("task") == "vqa" and not cfg.get("question"):
+                        missing.append("question")
+                    if missing:
+                        inputs.view(
+                            "json_warn",
+                            types.Warning(
+                                label="Missing required: " + ", ".join(missing)
+                            ),
+                        )
+                    else:
+                        inputs.view(
+                            "json_ok",
+                            types.Notice(
+                                label=f"Valid: {cfg['task']} task with {cfg['model']}"
+                            ),
+                        )
+        elif config_mode == "reset":
+            inputs.view(
+                "reset_notice",
+                types.Notice(
+                    label="All stored settings (global and dataset) will be"
+                    " cleared and defaults restored."
+                ),
+            )
+        else:
+            _model_selector(ctx, inputs, stored)
+            _server_settings(ctx, inputs, stored)
+            task = _task_selector(ctx, inputs, stored)
+            _task_settings(ctx, inputs, task, stored)
+            _output_settings(ctx, inputs, task)
+            _advanced_settings(ctx, inputs, stored)
+
+        if config_mode != "reset":
+            inputs.view_target(ctx)
 
         return types.Property(inputs, view=types.View(label="vLLM Inference"))
 
@@ -56,9 +141,35 @@ class VLLMInference(foo.Operator):
 
     def execute(self, ctx):
         params = ctx.params
+        config_mode = params.get("config_mode", "manual")
 
-        engine, base_url, api_key = _create_engine(params, ctx.secrets)
-        task = _create_task(params)
+        # Handle reset mode — clear all stored configs
+        if config_mode == "reset":
+            clear_global_config()
+            ctx.dataset.info.pop("_vllm_config", None)
+            ctx.dataset.save()
+            if not ctx.delegated:
+                yield ctx.trigger("reload_dataset")
+            return
+
+        # Handle JSON paste mode — merge imported config into params
+        if config_mode == "json":
+            raw = params.get("config_json") or ""
+            cfg, err = parse_config_json(raw)
+            if err:
+                yield _error(ctx, f"Config import failed: {err}")
+                return
+            params.update(cfg)
+            if not params.get("model") or not params.get("task"):
+                yield _error(ctx, "Config missing required 'model' or 'task'")
+                return
+
+        try:
+            engine, base_url, api_key = _create_engine(params, ctx.secrets)
+            task = _create_task(params)
+        except Exception as e:
+            yield _error(ctx, str(e))
+            return
 
         if params.get("temperature") is None:
             engine.temperature = task.default_temperature
@@ -203,11 +314,11 @@ class VLLMInference(foo.Operator):
             }
             ctx.dataset.info["vllm_runs"] = runs
 
-        ctx.dataset.info["_vllm_config"] = {
-            "model": params["model"],
-            "base_url": base_url,
-            "api_key": api_key,
-        }
+        # Persist full config to both tiers
+        params["base_url"] = base_url
+        params["api_key"] = api_key
+        save_global_config(params)
+        ctx.dataset.info["_vllm_config"] = pick_params(params)
         ctx.dataset.save()
 
         # 8. Reload dataset in App
@@ -217,17 +328,39 @@ class VLLMInference(foo.Operator):
     def resolve_output(self, ctx):
         outputs = types.Object()
         outputs.str("summary", label="Summary")
+
+        if ctx.params.get("config_mode") != "reset":
+            cfg_json = json.dumps(
+                pick_params(ctx.params, exclude=("api_key",)), indent=2
+            )
+            outputs.str(
+                "config_export",
+                label="Exportable Config (copy to reuse)",
+                default=cfg_json,
+                view=types.CodeView(language="json", read_only=True),
+            )
+
         return types.Property(outputs, view=types.View(label="Complete"))
 
 
 # -- Helpers --
 
 
-def _stored(ctx):
-    """Read persisted settings from dataset info."""
-    if not ctx.dataset:
-        return {}
-    return ctx.dataset.info.get("_vllm_config") or {}
+def _error(ctx, message):
+    """Yield-safe error via set_progress (raising breaks generator streams)."""
+    label = f"Error: {message}"
+    if ctx.delegated:
+        ctx.set_progress(progress=0, label=label)
+        return None
+    return ctx.trigger("set_progress", {"progress": 0, "label": label})
+
+
+def _resolve_config(ctx):
+    """Merge dataset config > global config > _DEFAULTS."""
+    merged = dict(_DEFAULTS)
+    for cfg in (get_global_config(), ctx.dataset.info.get("_vllm_config") or {}):
+        merged.update({k: v for k, v in cfg.items() if v is not None})
+    return merged
 
 
 def _create_engine(params, secrets):
@@ -262,10 +395,7 @@ def _create_engine(params, secrets):
 
 def _create_task(params):
     """Build a TaskConfig from operator params."""
-    classes = None
-    raw_classes = params.get("classes")
-    if raw_classes:
-        classes = [c.strip() for c in raw_classes.split(",")]
+    classes = normalize_classes(params.get("classes"))
 
     return TaskConfig(
         task=params["task"],
@@ -284,6 +414,12 @@ def _resolve_field_name(dataset, task_name, overwrite=False):
     """Resolve the output field name for a task run.
 
     Produces: vllm_infer_task_name, vllm_infer_task_name1, ...
+
+    Args:
+        dataset: FiftyOne dataset to check for existing fields.
+        task_name: task identifier used in the field name.
+        overwrite: if True, reuse the highest existing field name
+            instead of incrementing.
     """
     schema = dataset.get_field_schema(flat=True)
     base = f"vllm_infer_{task_name}"
@@ -302,7 +438,14 @@ def _resolve_field_name(dataset, task_name, overwrite=False):
 
 
 def _write_batch_results(dataset, field_name, results, errors):
-    """Write a batch of results and errors as flat sample fields."""
+    """Write a batch of results and errors as flat sample fields.
+
+    Args:
+        dataset: FiftyOne dataset to write to.
+        field_name: base field name for results.
+        results: dict mapping sample ID to FiftyOne label.
+        errors: dict mapping sample ID to error string.
+    """
     if results:
         dataset.set_values(
             field_name,
@@ -323,6 +466,13 @@ def _write_batch_results(dataset, field_name, results, errors):
 
 
 def _model_selector(ctx, inputs, stored):
+    """Add model selection field to the input form.
+
+    Args:
+        ctx: operator execution context.
+        inputs: form object to populate.
+        stored: resolved config dict with defaults merged.
+    """
     inputs.str(
         "model",
         label="Model",
@@ -333,6 +483,13 @@ def _model_selector(ctx, inputs, stored):
 
 
 def _server_settings(ctx, inputs, stored):
+    """Add server URL and API key fields to the input form.
+
+    Args:
+        ctx: operator execution context.
+        inputs: form object to populate.
+        stored: resolved config dict with defaults merged.
+    """
     inputs.view(
         "server_header",
         types.Header(label="Server Settings", divider=True),
@@ -341,18 +498,28 @@ def _server_settings(ctx, inputs, stored):
         "base_url",
         label="Server URL",
         required=True,
-        default=stored.get("base_url", "http://localhost:8000/v1"),
+        default=stored.get("base_url"),
         description="vLLM OpenAI-compatible API endpoint",
     )
     inputs.str(
         "api_key",
         label="API Key",
-        default=stored.get("api_key", "EMPTY"),
+        default=stored.get("api_key"),
         description="API key for authentication (use 'EMPTY' for no auth)",
     )
 
 
-def _task_selector(ctx, inputs):
+def _task_selector(ctx, inputs, stored):
+    """Add task dropdown to the input form.
+
+    Args:
+        ctx: operator execution context.
+        inputs: form object to populate.
+        stored: resolved config dict with defaults merged.
+
+    Returns:
+        Selected task name, or None if not yet chosen.
+    """
     task_dropdown = types.Dropdown(label="Task")
     task_dropdown.add_choice(
         "caption",
@@ -393,13 +560,22 @@ def _task_selector(ctx, inputs):
         "task",
         task_dropdown.values(),
         required=True,
+        default=stored.get("task"),
         label="Task",
         view=task_dropdown,
     )
     return ctx.params.get("task", None)
 
 
-def _task_settings(ctx, inputs, task):
+def _task_settings(ctx, inputs, task, stored):
+    """Add task-specific settings (classes, question, prompt) to the form.
+
+    Args:
+        ctx: operator execution context.
+        inputs: form object to populate.
+        task: selected task name (e.g. "classify", "vqa"), or None.
+        stored: resolved config dict with defaults merged.
+    """
     if task is None:
         return
 
@@ -408,22 +584,16 @@ def _task_settings(ctx, inputs, task):
         types.Header(label="Task Settings", divider=True),
     )
 
-    if task in ("classify", "tag"):
-        inputs.str(
-            "classes",
-            label="Classes",
-            required=True,
-            description=("Comma-separated class names (e.g., cat, dog, bird)"),
-        )
-    elif task == "detect":
+    if task in ("classify", "tag", "detect"):
+        stored_classes = stored.get("classes") or ""
+        if isinstance(stored_classes, list):
+            stored_classes = ", ".join(stored_classes)
         inputs.str(
             "classes",
             label="Classes",
             required=False,
-            description=(
-                "Optional: comma-separated classes to detect"
-                " (leave empty for open detection)"
-            ),
+            default=stored_classes,
+            description=("Comma-separated class names (leave empty for open-ended)"),
         )
 
     if task == "vqa":
@@ -431,6 +601,7 @@ def _task_settings(ctx, inputs, task):
             "question",
             label="Question",
             required=True,
+            default=stored.get("question", ""),
             description="Question to ask about each image",
         )
 
@@ -439,12 +610,14 @@ def _task_settings(ctx, inputs, task):
             "prompt",
             label="Prompt",
             required=True,
+            default=stored.get("prompt", ""),
             description="Prompt to send with each image",
         )
         inputs.str(
             "system_prompt",
             label="System Prompt",
             required=False,
+            default=stored.get("system_prompt", ""),
             description="Optional system prompt for context",
         )
 
@@ -453,11 +626,19 @@ def _task_settings(ctx, inputs, task):
             "prompt_override",
             label="Prompt Override",
             required=False,
+            default=stored.get("prompt_override", ""),
             description="Override the default prompt for this task",
         )
 
 
 def _output_settings(ctx, inputs, task):
+    """Add output field and metadata logging settings to the form.
+
+    Args:
+        ctx: operator execution context.
+        inputs: form object to populate.
+        task: selected task name.
+    """
     if not task or not ctx.dataset:
         return
 
@@ -502,7 +683,14 @@ def _output_settings(ctx, inputs, task):
     )
 
 
-def _advanced_settings(ctx, inputs):
+def _advanced_settings(ctx, inputs, stored):
+    """Add collapsible advanced settings (temperature, batch size, etc.).
+
+    Args:
+        ctx: operator execution context.
+        inputs: form object to populate.
+        stored: resolved config dict with defaults merged.
+    """
     inputs.view(
         "adv_header",
         types.Header(label="Advanced Settings", divider=True),
@@ -519,7 +707,7 @@ def _advanced_settings(ctx, inputs):
     inputs.float(
         "temperature",
         label="Temperature",
-        default=None,
+        default=stored.get("temperature"),
         min=0.0,
         max=2.0,
         description=("Sampling temperature (leave empty for task-specific default)"),
@@ -527,7 +715,7 @@ def _advanced_settings(ctx, inputs):
     inputs.int(
         "max_tokens",
         label="Max Tokens",
-        default=_DEFAULTS["max_tokens"],
+        default=stored.get("max_tokens"),
         min=1,
         max=4096,
         description="Maximum tokens to generate per sample",
@@ -535,29 +723,28 @@ def _advanced_settings(ctx, inputs):
     inputs.float(
         "top_p",
         label="Top P",
-        default=_DEFAULTS["top_p"],
+        default=stored.get("top_p"),
         min=0.0,
         max=1.0,
     )
     inputs.int(
         "seed",
         label="Seed",
-        default=None,
+        default=stored.get("seed"),
         description="Random seed for reproducible results (leave empty for non-deterministic)",
     )
     inputs.int(
         "batch_size",
         label="Batch Size",
-        default=_DEFAULTS["batch_size"],
+        default=stored.get("batch_size"),
         min=1,
         max=512,
         description="Number of samples per inference batch",
     )
-
     inputs.int(
         "max_concurrent",
         label="Max Concurrent Requests",
-        default=_DEFAULTS["max_concurrent"],
+        default=stored.get("max_concurrent"),
         min=1,
         max=256,
         description="Maximum parallel HTTP requests to vLLM server",
@@ -565,7 +752,7 @@ def _advanced_settings(ctx, inputs):
     inputs.int(
         "max_workers",
         label="Image Loading Workers",
-        default=_DEFAULTS["max_workers"],
+        default=stored.get("max_workers"),
         min=1,
         max=32,
         description=("Thread pool size for parallel image loading/encoding"),
@@ -587,7 +774,7 @@ def _advanced_settings(ctx, inputs):
     inputs.enum(
         "image_mode",
         image_dropdown.values(),
-        default=_DEFAULTS["image_mode"],
+        default=stored.get("image_mode"),
         label="Image Mode",
         view=image_dropdown,
     )
@@ -601,7 +788,7 @@ def _advanced_settings(ctx, inputs):
         inputs.enum(
             "coordinate_format",
             coord_dropdown.values(),
-            default=_DEFAULTS["coordinate_format"],
+            default=stored.get("coordinate_format"),
             label="Coordinate Format",
             view=coord_dropdown,
             description=("Bounding box coordinate convention used by the model"),
@@ -614,7 +801,7 @@ def _advanced_settings(ctx, inputs):
         inputs.enum(
             "box_format",
             box_dropdown.values(),
-            default=_DEFAULTS["box_format"],
+            default=stored.get("box_format"),
             label="Box Format",
             view=box_dropdown,
             description="Bounding box format produced by the model",

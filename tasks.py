@@ -28,7 +28,14 @@ class TaskConfig:
             "system": (
                 "You are an image classifier. Respond with exactly one class label."
             ),
+            "system_open": (
+                "You are an image classifier. Respond with a JSON object:"
+                ' {"label": "your label"}'
+            ),
             "prompt": "Classify this image. Choose exactly one: {classes}",
+            "prompt_open": (
+                "Classify this image with the single most appropriate label."
+            ),
             "output_type": "Classification",
             "default_field": "classification",
             "default_temperature": 0.0,
@@ -39,6 +46,7 @@ class TaskConfig:
                 ' {"labels": ["tag1", "tag2", ...]}'
             ),
             "prompt": ("Tag this image with all applicable labels from: {classes}"),
+            "prompt_open": ("Tag this image with all applicable descriptive labels."),
             "output_type": "Classifications",
             "default_field": "tags",
             "default_temperature": 0.0,
@@ -122,6 +130,21 @@ class TaskConfig:
         box_format="xyxy",
         **template_kwargs,
     ):
+        """Initialize task configuration with prompts and constraints.
+
+        Args:
+            task: task identifier (one of TASKS keys).
+            prompt: custom user prompt. If None, uses the task-specific
+                default (or open-ended variant when classes is None).
+            system_prompt: custom system prompt. If None, uses task default.
+            classes: list of class labels for classify/tag/detect. If None,
+                open-ended mode is used for classify/tag.
+            coordinate_format: bounding box coordinate convention
+                ("normalized_1000", "normalized_1", or "pixel").
+            box_format: bounding box format ("xyxy", "xywh", or "cxcywh").
+            **template_kwargs: additional format kwargs for prompt templates
+                (e.g. question= for VQA).
+        """
         if task not in self.TASKS:
             raise ValueError(f"Unknown task: {task}. Must be one of {list(self.TASKS)}")
 
@@ -157,8 +180,9 @@ class TaskConfig:
                 " as " + box_labels + " in " + coord_desc + "."
             )
         else:
-            default_system = defaults.get("system", "")
-            default_prompt = defaults.get("prompt", "")
+            open_ended = task in ("classify", "tag") and not classes
+            default_system = defaults.get("system_open" if open_ended else "system", "")
+            default_prompt = defaults.get("prompt_open" if open_ended else "prompt", "")
             default_prompt_with_classes = None
 
         self.system_prompt = (
@@ -209,22 +233,28 @@ class TaskConfig:
 
         Used as: extra_body={"structured_outputs": result}
         """
-        if self.task == "classify" and self.classes:
-            return {"choice": self.classes}
-
-        if self.task == "tag" and self.classes:
+        if self.task == "classify":
+            if self.classes:
+                return {"choice": self.classes}
             return {
                 "json": {
                     "type": "object",
-                    "properties": {
-                        "labels": {
-                            "type": "array",
-                            "items": {
-                                "type": "string",
-                                "enum": self.classes,
-                            },
-                        }
-                    },
+                    "properties": {"label": {"type": "string"}},
+                    "required": ["label"],
+                    "additionalProperties": False,
+                }
+            }
+
+        if self.task == "tag":
+            items = (
+                {"type": "string", "enum": self.classes}
+                if self.classes
+                else {"type": "string"}
+            )
+            return {
+                "json": {
+                    "type": "object",
+                    "properties": {"labels": {"type": "array", "items": items}},
                     "required": ["labels"],
                     "additionalProperties": False,
                 }
@@ -301,6 +331,10 @@ class TaskConfig:
                 data = json.loads(text)
                 key = self._STRING_KEYS[self.task]
                 return fo.Classification(label=data[key])
+            # classify: choice constraint returns bare text, json returns {"label": "..."}
+            if self.task == "classify" and not self.classes:
+                data = json.loads(text)
+                return fo.Classification(label=data["label"])
             return fo.Classification(label=text.strip())
 
         data = json.loads(text)
@@ -325,6 +359,11 @@ class TaskConfig:
         The JSON structure is guaranteed by the schema constraint.
         This method validates what schemas cannot enforce:
         coordinate ranges, degenerate boxes, array lengths.
+
+        Args:
+            data: parsed JSON dict with "detections" key.
+            image_width: pixel width (required for pixel coordinate format).
+            image_height: pixel height (required for pixel coordinate format).
         """
         detections = []
         raw = data.get("detections", [])
@@ -374,6 +413,14 @@ def _convert_box(
       B. Normalize to [0, 1] based on coordinate_format.
 
     Returns None if degenerate or missing required dimensions.
+
+    Args:
+        v0, v1, v2, v3: box coordinates (meaning depends on box_format).
+        coordinate_format: coordinate convention used by the model
+            ("normalized_1000", "normalized_1", or "pixel").
+        box_format: format of input coordinates ("xyxy", "xywh", "cxcywh").
+        img_w: image width in pixels (required for "pixel" format).
+        img_h: image height in pixels (required for "pixel" format).
     """
     # Step A: convert to xyxy
     if box_format == "xywh":

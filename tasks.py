@@ -76,13 +76,6 @@ class TaskConfig:
             "default_field": "ocr_text",
             "default_temperature": 0.0,
         },
-        "custom": {
-            "system": ('Respond with a JSON object: {"response": "your response"}'),
-            "prompt": "{prompt}",
-            "output_type": "Classification",
-            "default_field": "vlm_output",
-            "default_temperature": 0.2,
-        },
     }
 
     _BOX_FORMATS = {
@@ -126,7 +119,7 @@ class TaskConfig:
         prompt=None,
         system_prompt=None,
         classes=None,
-        coordinate_format="normalized_1000",
+        coordinate_format="pixel",
         box_format="xyxy",
         **template_kwargs,
     ):
@@ -223,7 +216,6 @@ class TaskConfig:
         "caption": "text",
         "vqa": "answer",
         "ocr": "text",
-        "custom": "response",
     }
 
     def get_structured_outputs(self):

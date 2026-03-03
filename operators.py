@@ -27,7 +27,7 @@ _DEFAULTS = {
     "max_concurrent": 16,
     "max_workers": 4,
     "image_mode": "auto",
-    "coordinate_format": "normalized_1000",
+    "coordinate_format": "pixel",
     "box_format": "xyxy",
 }
 
@@ -551,11 +551,6 @@ def _task_selector(ctx, inputs, stored):
         label="OCR",
         description="Extract text visible in the image",
     )
-    task_dropdown.add_choice(
-        "custom",
-        label="Custom",
-        description="Custom prompt with free-form response",
-    )
     inputs.enum(
         "task",
         task_dropdown.values(),
@@ -605,30 +600,13 @@ def _task_settings(ctx, inputs, task, stored):
             description="Question to ask about each image",
         )
 
-    if task == "custom":
-        inputs.str(
-            "prompt",
-            label="Prompt",
-            required=True,
-            default=stored.get("prompt", ""),
-            description="Prompt to send with each image",
-        )
-        inputs.str(
-            "system_prompt",
-            label="System Prompt",
-            required=False,
-            default=stored.get("system_prompt", ""),
-            description="Optional system prompt for context",
-        )
-
-    if task != "custom":
-        inputs.str(
-            "prompt_override",
-            label="Prompt Override",
-            required=False,
-            default=stored.get("prompt_override", ""),
-            description="Override the default prompt for this task",
-        )
+    inputs.str(
+        "prompt_override",
+        label="Prompt Override",
+        required=False,
+        default=stored.get("prompt_override", ""),
+        description="Override the default prompt for this task",
+    )
 
 
 def _output_settings(ctx, inputs, task):

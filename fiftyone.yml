@@ -1,10 +1,10 @@
-name: "@fo-vllm/vllm"
+name: "@Burhan-Q/fo-vllm"
 type: plugin
-author: "fo-vllm contributors"
+author: "Burhan-Q"
 version: "0.1.0"
-description: "Universal VLM inference via vLLM — any model, any task, any scale"
+description: "Universal VLM inference via vLLM: any model, any task, any scale"
 fiftyone:
-  version: ">=0.25"
+  version: ">=1.13.2"
 operators:
   - run_vllm_inference
 secrets:

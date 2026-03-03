@@ -16,6 +16,16 @@ fiftyone plugins create /path/to/fo-vllm
 
 A `compose.yml` is included as a reference for launching a vLLM server with Docker. Requires vLLM >= 0.16.
 
+## Demos
+
+| Caption | Classify |
+|---------|----------|
+| ![Caption](assets/demo_caption.gif) | ![Classify](assets/demo_classify.gif) |
+
+| Detect | VQA |
+|--------|-----|
+| ![Detect](assets/demo_detect.gif) | ![VQA](assets/demo_vqa.gif) |
+
 ## Tasks
 
 | Task | FiftyOne Type | Structured Output |

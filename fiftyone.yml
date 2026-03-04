@@ -7,6 +7,7 @@ fiftyone:
   version: ">=1.13.2"
 operators:
   - run_vllm_inference
+  - check_vllm_status
 secrets:
   - FIFTYONE_VLLM_API_KEY
   - FIFTYONE_VLLM_BASE_URL

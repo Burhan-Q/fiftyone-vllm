@@ -137,7 +137,7 @@ class VLLMInference(foo.Operator):
         return types.Property(inputs, view=types.View(label="vLLM Inference"))
 
     def resolve_delegation(self, ctx):
-        return ctx.params.get("delegate", False)
+        return ctx.params.get("delegate", None)
 
     def execute(self, ctx):
         params = ctx.params
@@ -321,8 +321,13 @@ class VLLMInference(foo.Operator):
         ctx.dataset.info["_vllm_config"] = pick_params(params)
         ctx.dataset.save()
 
-        # 8. Reload dataset in App
-        if not ctx.delegated:
+        # 8. Notify / reload
+        if ctx.delegated:
+            # Signal the store so CheckVLLMStatus (running in the App
+            # process) is woken up via the change-stream notification.
+            store = ctx.store("vllm_status")
+            store.set("done", True)
+        else:
             yield ctx.trigger("reload_dataset")
 
     def resolve_output(self, ctx):
@@ -341,6 +346,67 @@ class VLLMInference(foo.Operator):
             )
 
         return types.Property(outputs, view=types.View(label="Complete"))
+
+
+class CheckVLLMStatus(foo.Operator):
+    """Subscribes to the ``vllm_status`` execution store via MongoDB
+    change-stream notifications.  When the delegated worker writes a
+    completion signal, this operator fires a toast and reloads the dataset.
+
+    Starts automatically on dataset open and waits up to 10 minutes for
+    a signal before silently exiting.
+    """
+
+    @property
+    def config(self):
+        return foo.OperatorConfig(
+            name="check_vllm_status",
+            label="Check vLLM Status",
+            on_dataset_open=True,
+            execute_as_generator=True,
+            unlisted=True,
+        )
+
+    async def execute(self, ctx):
+        import asyncio
+
+        from fiftyone.operators.store.notification_service import (
+            default_notification_service,
+        )
+
+        if not ctx.dataset:
+            return
+
+        loop = asyncio.get_running_loop()
+        event = asyncio.Event()
+
+        def _on_change(_message):
+            loop.call_soon_threadsafe(event.set)
+
+        sub_id = default_notification_service.subscribe(
+            "vllm_status",
+            callback=_on_change,
+            dataset_id=str(ctx.dataset._doc.id),
+        )
+
+        try:
+            await asyncio.wait_for(event.wait(), timeout=600)
+
+            store = ctx.store("vllm_status")
+            store.delete("done")
+
+            yield ctx.trigger(
+                "notify",
+                params={
+                    "message": "vLLM inference complete",
+                    "variant": "success",
+                },
+            )
+            yield ctx.trigger("reload_dataset")
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            default_notification_service.unsubscribe(sub_id)
 
 
 # -- Helpers --

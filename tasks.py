@@ -1,12 +1,76 @@
-"""TaskConfig: prompts, JSON schemas, output parsers, and post-generation
+"""TaskConfig: prompts, Pydantic output models, parsers, and post-generation
 validation for all VLM inference tasks."""
 
-import json
 import logging
+from typing import Annotated, Literal
 
 import fiftyone as fo
+from pydantic import BaseModel, Field, conlist, create_model
 
 logger = logging.getLogger(__name__)
+
+
+# -- Pydantic output models --
+
+
+class CaptionOutput(BaseModel):
+    text: str
+
+
+class VQAOutput(BaseModel):
+    answer: str
+
+
+class OCROutput(BaseModel):
+    text: str
+
+
+class ClassifyOpenOutput(BaseModel):
+    label: str
+
+
+def _make_classify_model(classes: list[str]) -> type[BaseModel]:
+    """Create a classify model with Literal-constrained label."""
+    ChoiceType = Literal[tuple(classes)]
+    return create_model("ClassifyOutput", label=(ChoiceType, ...))
+
+
+def _make_tag_model(classes: list[str] | None) -> type[BaseModel]:
+    """Create a tag model, optionally constrained to given classes."""
+    if classes:
+        ItemType = Literal[tuple(classes)]
+    else:
+        ItemType = str
+    return create_model("TagOutput", labels=(list[ItemType], ...))
+
+
+def _make_detect_model(
+    classes: list[str] | None,
+    coordinate_format: str,
+) -> type[BaseModel]:
+    """Create a detection model with dynamic box constraints."""
+    label_type = Literal[tuple(classes)] if classes else str
+
+    if coordinate_format == "normalized_1000":
+        BoxItem = Annotated[int, Field(ge=0, le=1000)]
+    elif coordinate_format == "normalized_1":
+        BoxItem = Annotated[float, Field(ge=0.0, le=1.0)]
+    else:  # pixel
+        BoxItem = Annotated[float, Field(ge=0)]
+
+    DetectionItem = create_model(
+        "DetectionItem",
+        label=(label_type, ...),
+        box=(conlist(BoxItem, min_length=4, max_length=4), ...),
+    )
+    return create_model("DetectOutput", detections=(list[DetectionItem], ...))
+
+
+_STATIC_MODELS = {
+    "caption": CaptionOutput,
+    "vqa": VQAOutput,
+    "ocr": OCROutput,
+}
 
 
 class TaskConfig:
@@ -210,158 +274,77 @@ class TaskConfig:
         )
         return messages
 
-    # -- Structured output constraints (vLLM 0.16+ StructuredOutputsParams) --
+    # -- Pydantic response model (for beta.chat.completions.parse) --
 
-    _STRING_KEYS = {
-        "caption": "text",
-        "vqa": "answer",
-        "ocr": "text",
-    }
+    def get_response_model(self) -> type[BaseModel]:
+        """Return a Pydantic model class for structured output parsing.
 
-    def get_structured_outputs(self):
-        """Return kwargs dict for StructuredOutputsParams.
-
-        Every task returns a structured output constraint. Never returns None.
-
-        Used as: extra_body={"structured_outputs": result}
+        Used as: response_format=self.get_response_model()
         """
+        if self.task in _STATIC_MODELS:
+            return _STATIC_MODELS[self.task]
+
         if self.task == "classify":
             if self.classes:
-                return {"choice": self.classes}
-            return {
-                "json": {
-                    "type": "object",
-                    "properties": {"label": {"type": "string"}},
-                    "required": ["label"],
-                    "additionalProperties": False,
-                }
-            }
+                return _make_classify_model(self.classes)
+            return ClassifyOpenOutput
 
         if self.task == "tag":
-            items = (
-                {"type": "string", "enum": self.classes}
-                if self.classes
-                else {"type": "string"}
-            )
-            return {
-                "json": {
-                    "type": "object",
-                    "properties": {"labels": {"type": "array", "items": items}},
-                    "required": ["labels"],
-                    "additionalProperties": False,
-                }
-            }
+            return _make_tag_model(self.classes)
 
         if self.task == "detect":
-            label_schema = {"type": "string"}
-            if self.classes:
-                label_schema["enum"] = self.classes
-            coord = self._COORD_FORMATS.get(
-                self.coordinate_format,
-                self._COORD_FORMATS["normalized_1000"],
-            )
-            return {
-                "json": {
-                    "type": "object",
-                    "properties": {
-                        "detections": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "label": label_schema,
-                                    "box": {
-                                        "type": "array",
-                                        "items": coord["item_schema"],
-                                        "minItems": 4,
-                                        "maxItems": 4,
-                                    },
-                                },
-                                "required": ["label", "box"],
-                                "additionalProperties": False,
-                            },
-                        }
-                    },
-                    "required": ["detections"],
-                    "additionalProperties": False,
-                }
-            }
+            return _make_detect_model(self.classes, self.coordinate_format)
 
-        if self.task in self._STRING_KEYS:
-            key = self._STRING_KEYS[self.task]
-            return {
-                "json": {
-                    "type": "object",
-                    "properties": {key: {"type": "string"}},
-                    "required": [key],
-                    "additionalProperties": False,
-                }
-            }
+        raise ValueError(f"No response model for task: {self.task}")
 
-        raise ValueError(f"No structured output schema for task: {self.task}")
+    # -- Output parsing (validated Pydantic instances) --
 
-    # -- Output parsing (all responses are structured) --
-
-    def parse_response(self, text, image_width=None, image_height=None):
-        """Parse VLM response into a FiftyOne label.
-
-        All responses are structured: either JSON from json= constraint
-        or a bare string from choice= constraint. json.loads() is the
-        only parsing mechanism used.
-
-        Every task returns a label type (Classification, Classifications,
-        or Detections), enabling dynamic attributes for metadata.
+    def parse_response(self, parsed, image_width=None, image_height=None):
+        """Convert a validated Pydantic response into a FiftyOne label.
 
         Args:
-            text: raw VLM response string.
-            image_width: pixel width of the source image (needed for
-                pixel coordinate normalization in detection tasks).
-            image_height: pixel height of the source image.
+            parsed: Pydantic model instance from beta.chat.completions.parse().
+            image_width: pixel width (needed for pixel coordinate normalization).
+            image_height: pixel height.
         """
-        if self.output_type == "Classification":
-            if self.task in self._STRING_KEYS:
-                data = json.loads(text)
-                key = self._STRING_KEYS[self.task]
-                return fo.Classification(label=data[key])
-            # classify: choice constraint returns bare text, json returns {"label": "..."}
-            if self.task == "classify" and not self.classes:
-                data = json.loads(text)
-                return fo.Classification(label=data["label"])
-            return fo.Classification(label=text.strip())
+        if self.task in ("caption", "ocr"):
+            return fo.Classification(label=parsed.text)
 
-        data = json.loads(text)
+        if self.task == "vqa":
+            return fo.Classification(label=parsed.answer)
 
-        if self.output_type == "Classifications":
+        if self.task == "classify":
+            return fo.Classification(label=parsed.label)
+
+        if self.task == "tag":
             return fo.Classifications(
-                classifications=[
-                    fo.Classification(label=label) for label in data["labels"]
-                ]
+                classifications=[fo.Classification(label=tag) for tag in parsed.labels]
             )
 
-        if self.output_type == "Detections":
+        if self.task == "detect":
             return self._parse_detections(
-                data, image_width=image_width, image_height=image_height
+                parsed, image_width=image_width, image_height=image_height
             )
 
-        raise ValueError(f"Unknown output type: {self.output_type}")
+        raise ValueError(f"Unknown task: {self.task}")
 
-    def _parse_detections(self, data, image_width=None, image_height=None):
+    def _parse_detections(self, parsed, image_width=None, image_height=None):
         """Post-generation validation for detection output.
 
-        The JSON structure is guaranteed by the schema constraint.
-        This method validates what schemas cannot enforce:
-        coordinate ranges, degenerate boxes, array lengths.
+        Pydantic guarantees structure and types. This method validates
+        what schemas cannot enforce: degenerate boxes, coordinate
+        normalization.
 
         Args:
-            data: parsed JSON dict with "detections" key.
+            parsed: Pydantic DetectOutput instance.
             image_width: pixel width (required for pixel coordinate format).
             image_height: pixel height (required for pixel coordinate format).
         """
         detections = []
-        raw = data.get("detections", [])
+        raw = parsed.detections
 
         for det in raw:
-            box = det.get("box", [])
+            box = det.box
             if len(box) != 4:
                 continue
 
@@ -377,7 +360,7 @@ class TaskConfig:
 
             detections.append(
                 fo.Detection(
-                    label=det.get("label", "object"),
+                    label=det.label,
                     bounding_box=list(result),
                 )
             )

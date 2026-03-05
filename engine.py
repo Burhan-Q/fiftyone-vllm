@@ -45,37 +45,37 @@ class VLLMEngine:
         if not models:
             raise ConnectionError("vLLM server returned no models")
 
-    def infer_batch(self, messages, structured_outputs):
-        """Run batch inference with structured output constraints.
+    def infer_batch(self, messages, response_model):
+        """Run batch inference with Pydantic structured output.
 
         Args:
             messages: list of OpenAI-format message lists, one per sample.
-            structured_outputs: dict passed to vLLM's StructuredOutputsParams.
-                Every task provides this — it is never None. Examples:
-                  {"choice": ["cat", "dog"]}
-                  {"json": {<JSON schema>}}
+            response_model: Pydantic BaseModel class for response parsing.
 
-        Returns list of response strings (valid JSON or choice-constrained
-        string).
+        Returns list of validated Pydantic instances (or Exceptions).
         """
-        return _run_async(self._async_infer_batch(messages, structured_outputs))
+        return _run_async(self._async_infer_batch(messages, response_model))
 
-    async def _async_infer_batch(self, messages, structured_outputs):
-        extra_body = {"structured_outputs": structured_outputs}
+    async def _async_infer_batch(self, messages, response_model):
         sem = asyncio.Semaphore(self.max_concurrent)
 
         async def _call(msgs):
             async with sem:
-                resp = await self._aclient.chat.completions.create(
+                resp = await self._aclient.beta.chat.completions.parse(
                     model=self.model,
                     messages=msgs,
                     temperature=self.temperature,
                     max_tokens=self.max_tokens,
                     top_p=self.top_p,
                     seed=self.seed,
-                    extra_body=extra_body,
+                    response_format=response_model,
                 )
-                return resp.choices[0].message.content
+                msg = resp.choices[0].message
+                if msg.refusal:
+                    raise ValueError(f"Model refused: {msg.refusal}")
+                if msg.parsed is None:
+                    raise ValueError(f"Parsing failed: {msg.content}")
+                return msg.parsed
 
         results = await asyncio.gather(
             *[_call(m) for m in messages], return_exceptions=True

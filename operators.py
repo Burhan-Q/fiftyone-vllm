@@ -184,7 +184,7 @@ class VLLMInference(foo.Operator):
         total = len(ids)
         max_workers = params.get("max_workers", _DEFAULTS["max_workers"])
 
-        structured_outputs = task.get_structured_outputs()
+        response_model = task.get_response_model()
 
         # 5a. Resolve output field name (vllm_infer_caption, ...)
         field_name = _resolve_field_name(
@@ -256,7 +256,7 @@ class VLLMInference(foo.Operator):
             # 6c. Batch inference with structured output
             responses = engine.infer_batch(
                 batch_messages,
-                structured_outputs=structured_outputs,
+                response_model=response_model,
             )
 
             # 6d. Parse responses with per-sample error handling

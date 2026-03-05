@@ -9,7 +9,41 @@ import fiftyone as fo
 logger = logging.getLogger(__name__)
 
 
-class TaskConfig:
+class BaseTaskConfig:
+    """Shared prompt/message logic for all task types."""
+
+    def __init__(self, system_prompt="", prompt=""):
+        self.system_prompt = system_prompt
+        self.prompt = prompt
+
+    def build_messages(self, image_content, context=None):
+        """Build OpenAI-format messages. Optional context appended to user
+        prompt."""
+        messages = []
+        if self.system_prompt:
+            messages.append({"role": "system", "content": self.system_prompt})
+        text = self.prompt
+        if context:
+            text = f"{text}\n\n{context}"
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    image_content,
+                    {"type": "text", "text": text},
+                ],
+            }
+        )
+        return messages
+
+    def get_structured_outputs(self):
+        raise NotImplementedError
+
+    def parse_response(self, text, **kwargs):
+        raise NotImplementedError
+
+
+class TaskConfig(BaseTaskConfig):
     """Builds prompts, structured output constraints, and parses VLM
     responses."""
 
@@ -178,9 +212,7 @@ class TaskConfig:
             default_prompt = defaults.get("prompt_open" if open_ended else "prompt", "")
             default_prompt_with_classes = None
 
-        self.system_prompt = (
-            system_prompt if system_prompt is not None else default_system
-        )
+        resolved_system = system_prompt if system_prompt is not None else default_system
 
         if prompt is not None:
             raw_prompt = prompt
@@ -192,23 +224,9 @@ class TaskConfig:
         fmt_kwargs = {**template_kwargs}
         if classes:
             fmt_kwargs["classes"] = ", ".join(classes)
-        self.prompt = raw_prompt.format(**fmt_kwargs) if fmt_kwargs else raw_prompt
+        resolved_prompt = raw_prompt.format(**fmt_kwargs) if fmt_kwargs else raw_prompt
 
-    def build_messages(self, image_content):
-        """Build OpenAI-format messages for one image."""
-        messages = []
-        if self.system_prompt:
-            messages.append({"role": "system", "content": self.system_prompt})
-        messages.append(
-            {
-                "role": "user",
-                "content": [
-                    image_content,
-                    {"type": "text", "text": self.prompt},
-                ],
-            }
-        )
-        return messages
+        super().__init__(system_prompt=resolved_system, prompt=resolved_prompt)
 
     # -- Structured output constraints (vLLM 0.16+ StructuredOutputsParams) --
 
@@ -390,6 +408,237 @@ class TaskConfig:
             )
 
         return fo.Detections(detections=detections)
+
+
+class JudgeConfig(BaseTaskConfig):
+    """Builds prompts, schemas, and parses responses for annotation quality
+    judging."""
+
+    _SYSTEM_PROMPT = (
+        "You are an annotation quality judge. Analyze the image and evaluate"
+        " whether the provided annotations are correct. Be precise and"
+        " objective."
+    )
+
+    def __init__(
+        self,
+        annotation_type,
+        is_patch=False,
+        open_vocab=False,
+        ds_labels=None,
+        check_missing=False,
+        top5=False,
+        coordinate_format="pixel",
+        box_format="xyxy",
+    ):
+        self.annotation_type = annotation_type
+        self.is_patch = is_patch
+        self.open_vocab = open_vocab
+        self.ds_labels = ds_labels or []
+        self.check_missing = check_missing and not is_patch
+        self.top5 = top5
+        self.coordinate_format = coordinate_format
+        self.box_format = box_format
+
+        prompt = self._build_prompt()
+        super().__init__(system_prompt=self._SYSTEM_PROMPT, prompt=prompt)
+
+    def _build_prompt(self):
+        if self.open_vocab:
+            vocab = "Consider any applicable label."
+        else:
+            vocab = f"Only consider these labels: {', '.join(self.ds_labels)}"
+
+        if self.annotation_type == "classification":
+            return (
+                "{context}\n"
+                f"{vocab}\n"
+                "Judge whether the label correctly describes this image."
+            )
+
+        # Detection
+        if self.is_patch:
+            return (
+                "This is a cropped region around a single annotated object.\n"
+                "{context}\n"
+                f"{vocab}\n"
+                "Judge:\n"
+                "1. Is the label correct?\n"
+                "2. Is the bounding box correctly placed and sized?"
+            )
+
+        missing = ""
+        if self.check_missing:
+            missing = (
+                "\nAlso identify any objects visible in the image that"
+                " should be annotated but are not."
+            )
+
+        return (
+            "{context}\n"
+            f"{vocab}\n"
+            "For each annotation, judge:\n"
+            "1. Is the label correct for the object in the bounding box?\n"
+            "2. Is the bounding box correctly placed and sized?"
+            f"{missing}"
+        )
+
+    def build_context(self, annotation, image_width=None, image_height=None):
+        """Serialize annotation into text context for the prompt."""
+        if self.annotation_type == "classification":
+            return f'Current annotation: label="{annotation.label}"'
+
+        if self.is_patch:
+            return f'Current annotation: label="{annotation.label}"'
+
+        # Full image detection — enumerate all detections
+        lines = ["Current annotations:"]
+        for i, det in enumerate(annotation.detections):
+            box = _fo_box_to_pixel_xyxy(det.bounding_box, image_width, image_height)
+            lines.append(f'[{i}] label="{det.label}", box={box}')
+        return "\n".join(lines)
+
+    def build_messages(self, image_content, context=None):
+        """Build messages with context inserted into prompt template."""
+        messages = []
+        if self.system_prompt:
+            messages.append({"role": "system", "content": self.system_prompt})
+        text = self.prompt.format(context=context or "")
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    image_content,
+                    {"type": "text", "text": text},
+                ],
+            }
+        )
+        return messages
+
+    def get_structured_outputs(self):
+        """Return structured output schema based on annotation type and
+        config."""
+        label_schema = {"type": "string"}
+        if not self.open_vocab and self.ds_labels:
+            label_schema["enum"] = self.ds_labels
+
+        if self.annotation_type == "classification":
+            props = {
+                "label_correct": {"type": "boolean"},
+                "correct_label": label_schema,
+            }
+            required = ["label_correct", "correct_label"]
+            if self.top5:
+                item_schema = {"type": "string"}
+                if not self.open_vocab and self.ds_labels:
+                    item_schema["enum"] = self.ds_labels
+                props["top5"] = {
+                    "type": "array",
+                    "items": item_schema,
+                    "minItems": 1,
+                    "maxItems": 5,
+                }
+                required.append("top5")
+            return {
+                "json": {
+                    "type": "object",
+                    "properties": props,
+                    "required": required,
+                    "additionalProperties": False,
+                }
+            }
+
+        # Detection — patch mode
+        if self.is_patch:
+            return {
+                "json": {
+                    "type": "object",
+                    "properties": {
+                        "label_correct": {"type": "boolean"},
+                        "correct_label": label_schema,
+                        "box_correct": {"type": "boolean"},
+                    },
+                    "required": [
+                        "label_correct",
+                        "correct_label",
+                        "box_correct",
+                    ],
+                    "additionalProperties": False,
+                }
+            }
+
+        # Detection — full image
+        judgment_props = {
+            "index": {"type": "integer"},
+            "label_correct": {"type": "boolean"},
+            "correct_label": label_schema,
+            "box_correct": {"type": "boolean"},
+        }
+        props = {
+            "judgments": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": judgment_props,
+                    "required": [
+                        "index",
+                        "label_correct",
+                        "correct_label",
+                        "box_correct",
+                    ],
+                    "additionalProperties": False,
+                },
+            }
+        }
+        required = ["judgments"]
+
+        if self.check_missing:
+            coord = TaskConfig._COORD_FORMATS.get(
+                self.coordinate_format,
+                TaskConfig._COORD_FORMATS["pixel"],
+            )
+            props["missing"] = {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "label": {"type": "string"},
+                        "box": {
+                            "type": "array",
+                            "items": coord["item_schema"],
+                            "minItems": 4,
+                            "maxItems": 4,
+                        },
+                    },
+                    "required": ["label", "box"],
+                    "additionalProperties": False,
+                },
+            }
+            required.append("missing")
+
+        return {
+            "json": {
+                "type": "object",
+                "properties": props,
+                "required": required,
+                "additionalProperties": False,
+            }
+        }
+
+    def parse_response(self, text, **kwargs):
+        """Parse VLM judgment response into a dict."""
+        return json.loads(text)
+
+
+def _fo_box_to_pixel_xyxy(bbox, img_w, img_h):
+    """Convert FiftyOne [x, y, w, h] (0-1 normalized) to pixel [x1, y1, x2,
+    y2]."""
+    x, y, w, h = bbox
+    x1 = int(round(x * img_w))
+    y1 = int(round(y * img_h))
+    x2 = int(round((x + w) * img_w))
+    y2 = int(round((y + h) * img_h))
+    return [x1, y1, x2, y2]
 
 
 _COORD_SCALE = {"normalized_1000": 1000.0, "normalized_1": 1.0}

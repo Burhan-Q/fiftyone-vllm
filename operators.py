@@ -127,8 +127,11 @@ class VLLMInference(foo.Operator):
             _model_selector(ctx, inputs, stored)
             _server_settings(ctx, inputs, stored)
             task = _task_selector(ctx, inputs, stored)
-            _task_settings(ctx, inputs, task, stored)
-            _output_settings(ctx, inputs, task)
+            if task == "judge":
+                _judge_settings(ctx, inputs, stored)
+            else:
+                _task_settings(ctx, inputs, task, stored)
+                _output_settings(ctx, inputs, task)
             _advanced_settings(ctx, inputs, stored)
 
         if config_mode != "reset":
@@ -166,6 +169,15 @@ class VLLMInference(foo.Operator):
 
         try:
             engine, base_url, api_key = _create_engine(params, ctx.secrets)
+        except Exception as e:
+            yield _error(ctx, str(e))
+            return
+
+        if params["task"] == "judge":
+            yield from _execute_judge(ctx, engine, params)
+            return
+
+        try:
             task = _create_task(params)
         except Exception as e:
             yield _error(ctx, str(e))
@@ -617,6 +629,11 @@ def _task_selector(ctx, inputs, stored):
         label="OCR",
         description="Extract text visible in the image",
     )
+    task_dropdown.add_choice(
+        "judge",
+        label="Judge",
+        description="Evaluate annotation quality and tag errors",
+    )
     inputs.enum(
         "task",
         task_dropdown.values(),
@@ -850,3 +867,427 @@ def _advanced_settings(ctx, inputs, stored):
             view=box_dropdown,
             description="Bounding box format produced by the model",
         )
+
+    task = ctx.params.get("task")
+    if task == "judge":
+        coord_dropdown = types.Dropdown()
+        coord_dropdown.add_choice("normalized_1000", label="0-1000 (Qwen default)")
+        coord_dropdown.add_choice("normalized_1", label="0-1 (relative)")
+        coord_dropdown.add_choice("pixel", label="Pixel coordinates")
+        inputs.enum(
+            "coordinate_format",
+            coord_dropdown.values(),
+            default=stored.get("coordinate_format"),
+            label="Coordinate Format",
+            view=coord_dropdown,
+            description=(
+                "Coordinate convention for missing object boxes"
+                " (only used when Check Missing is enabled)"
+            ),
+        )
+
+        box_dropdown = types.Dropdown()
+        box_dropdown.add_choice("xyxy", label="xyxy — corners")
+        box_dropdown.add_choice("xywh", label="xywh — origin + size")
+        box_dropdown.add_choice("cxcywh", label="cxcywh — center + size")
+        inputs.enum(
+            "box_format",
+            box_dropdown.values(),
+            default=stored.get("box_format"),
+            label="Box Format",
+            view=box_dropdown,
+            description="Box format for missing object boxes",
+        )
+
+
+def _judge_settings(ctx, inputs, stored):
+    """Add judge-specific settings to the input form."""
+    import fiftyone as fo
+
+    inputs.view(
+        "judge_header",
+        types.Header(label="Judge Settings", divider=True),
+    )
+
+    if not ctx.dataset:
+        return
+
+    # Build annotation field choices from dataset schema
+    schema = ctx.dataset.get_field_schema()
+    annotation_fields = {}
+    for name, field in schema.items():
+        if not hasattr(field, "document_type"):
+            continue
+        doc_type = field.document_type
+        if doc_type is fo.Classification:
+            annotation_fields[name] = "classification"
+        elif doc_type is fo.Detections:
+            annotation_fields[name] = "detection"
+
+    if not annotation_fields:
+        inputs.view(
+            "no_annotations",
+            types.Warning(
+                label="No Classification or Detections fields found in this dataset"
+            ),
+        )
+        return
+
+    field_dropdown = types.Dropdown(label="Annotation Field")
+    for name in annotation_fields:
+        field_dropdown.add_choice(name, label=name)
+    inputs.enum(
+        "annotation_field",
+        field_dropdown.values(),
+        required=True,
+        default=stored.get("annotation_field"),
+        label="Annotation Field",
+        view=field_dropdown,
+        description="Field containing annotations to judge",
+    )
+
+    ann_field = ctx.params.get("annotation_field")
+    if not ann_field or ann_field not in annotation_fields:
+        return
+
+    ann_type = annotation_fields[ann_field]
+
+    # Auto-detect labels
+    if ann_type == "classification":
+        ds_labels = ctx.dataset.distinct(f"{ann_field}.label")
+    else:
+        ds_labels = ctx.dataset.distinct(f"{ann_field}.detections.label")
+
+    inputs.view(
+        "ann_info",
+        types.Notice(label=f"Type: {ann_type} | {len(ds_labels)} distinct label(s)"),
+    )
+
+    inputs.str(
+        "ds_labels",
+        label="Labels",
+        default=", ".join(ds_labels) if ds_labels else "",
+        description=("Comma-separated labels to consider (auto-populated from field)"),
+    )
+
+    inputs.bool(
+        "open_vocab",
+        label="Open vocabulary",
+        default=stored.get("open_vocab", False),
+        view=types.SwitchView(),
+        description="Allow the VLM to suggest any label, not just the listed ones",
+    )
+
+    if ann_type == "classification":
+        inputs.bool(
+            "top5",
+            label="Top-5 predictions",
+            default=stored.get("top5", False),
+            view=types.SwitchView(),
+            description="Ask the VLM for its top 5 label predictions",
+        )
+
+    if ann_type == "detection":
+        # Auto-detect patches view
+        view = ctx.view
+        auto_patch = (
+            hasattr(view, "_is_patches") and view._is_patches
+            if view is not None
+            else False
+        )
+        inputs.bool(
+            "is_patch",
+            label="Patch mode (single detection per image)",
+            default=stored.get("is_patch", auto_patch),
+            view=types.SwitchView(),
+            description=(
+                "Each image is a crop around one detection"
+                " (auto-detected from patches view)"
+            ),
+        )
+
+        is_patch = ctx.params.get("is_patch", auto_patch)
+        if not is_patch:
+            inputs.bool(
+                "check_missing",
+                label="Check for missing annotations",
+                default=stored.get("check_missing", False),
+                view=types.SwitchView(),
+                description=("Also identify unannotated objects in the image"),
+            )
+
+    inputs.view(
+        "judge_output_header",
+        types.Header(label="Output Settings", divider=True),
+    )
+    inputs.bool(
+        "log_metadata",
+        label="Log run metadata",
+        default=False,
+        view=types.SwitchView(),
+        description=("Store model name, prompt, and inference config in dataset info"),
+    )
+
+
+# -- Judge execution --
+
+
+def _execute_judge(ctx, engine, params):
+    """Generator that runs judge inference and applies tags."""
+    import fiftyone as fo
+
+    from .tasks import JudgeConfig
+
+    ann_field = params["annotation_field"]
+    batch_size = params.get("batch_size", _DEFAULTS["batch_size"])
+    image_mode = params.get("image_mode", _DEFAULTS["image_mode"])
+    max_workers = params.get("max_workers", _DEFAULTS["max_workers"])
+
+    view = ctx.target_view()
+
+    # Detect annotation type
+    schema = ctx.dataset.get_field_schema()
+    field_obj = schema[ann_field]
+    if field_obj.document_type is fo.Classification:
+        ann_type = "classification"
+    else:
+        ann_type = "detection"
+
+    # Parse ds_labels
+    raw_labels = params.get("ds_labels", "")
+    ds_labels = (
+        [s.strip() for s in raw_labels.split(",") if s.strip()] if raw_labels else []
+    )
+
+    judge = JudgeConfig(
+        annotation_type=ann_type,
+        is_patch=params.get("is_patch", False),
+        open_vocab=params.get("open_vocab", False),
+        ds_labels=ds_labels,
+        check_missing=params.get("check_missing", False),
+        top5=params.get("top5", False),
+        coordinate_format=params.get(
+            "coordinate_format", _DEFAULTS["coordinate_format"]
+        ),
+        box_format=params.get("box_format", _DEFAULTS["box_format"]),
+    )
+
+    ids = view.values("id")
+    filepaths = view.values("filepath")
+    annotations = view.values(ann_field)
+    total = len(ids)
+
+    # Always need image dimensions for detection context display
+    need_dims = ann_type == "detection" and not judge.is_patch
+    if need_dims or judge.check_missing:
+        view.compute_metadata()
+        widths = view.values("metadata.width")
+        heights = view.values("metadata.height")
+    else:
+        widths = [None] * total
+        heights = [None] * total
+
+    structured_outputs = judge.get_structured_outputs()
+
+    if judge.check_missing:
+        engine.temperature = params.get("temperature") or 0.0
+
+    # Process in batches
+    processed = 0
+    total_errors = 0
+    all_modified_annotations = {}
+    all_missing_detections = {}
+
+    for i in range(0, total, batch_size):
+        batch_ids = ids[i : i + batch_size]
+        batch_paths = filepaths[i : i + batch_size]
+        batch_anns = annotations[i : i + batch_size]
+        batch_widths = widths[i : i + batch_size]
+        batch_heights = heights[i : i + batch_size]
+
+        # Skip samples with no annotation
+        valid_indices = [j for j, ann in enumerate(batch_anns) if ann is not None]
+        if not valid_indices:
+            processed += len(batch_ids)
+            continue
+
+        valid_paths = [batch_paths[j] for j in valid_indices]
+        valid_ids = [batch_ids[j] for j in valid_indices]
+        valid_anns = [batch_anns[j] for j in valid_indices]
+        valid_widths = [batch_widths[j] for j in valid_indices]
+        valid_heights = [batch_heights[j] for j in valid_indices]
+
+        image_contents = build_image_contents(
+            valid_paths, image_mode=image_mode, max_workers=max_workers
+        )
+
+        # Build per-sample context and messages
+        batch_messages = []
+        for img, ann, img_w, img_h in zip(
+            image_contents, valid_anns, valid_widths, valid_heights
+        ):
+            context = judge.build_context(ann, img_w, img_h)
+            batch_messages.append(judge.build_messages(img, context=context))
+
+        responses = engine.infer_batch(
+            batch_messages, structured_outputs=structured_outputs
+        )
+
+        # Parse and apply tags
+        for sid, resp, ann, img_w, img_h in zip(
+            valid_ids, responses, valid_anns, valid_widths, valid_heights
+        ):
+            if isinstance(resp, Exception):
+                total_errors += 1
+                continue
+            try:
+                result = judge.parse_response(resp)
+                _apply_judge_tags(
+                    ann,
+                    result,
+                    ann_type,
+                    judge,
+                    img_w,
+                    img_h,
+                    all_missing_detections,
+                    sid,
+                )
+                all_modified_annotations[sid] = ann
+            except Exception:
+                total_errors += 1
+
+        processed += len(batch_ids)
+        label = f"{processed}/{total} samples"
+        if total_errors:
+            label += f" ({total_errors} errors)"
+
+        if ctx.delegated:
+            ctx.set_progress(progress=processed / total, label=label)
+        else:
+            yield ctx.trigger(
+                "set_progress",
+                dict(progress=processed / total, label=label),
+            )
+
+    # Bulk-write modified annotations
+    if all_modified_annotations:
+        ctx.dataset.set_values(
+            ann_field,
+            all_modified_annotations,
+            key_field="id",
+            dynamic=True,
+        )
+
+    # Write missing detections if any
+    if all_missing_detections:
+        missing_field = _resolve_field_name(ctx.dataset, "judge_missing", False)
+        ctx.dataset.set_values(
+            missing_field,
+            all_missing_detections,
+            key_field="id",
+            dynamic=True,
+        )
+
+    # Persist config and metadata
+    if params.get("log_metadata", False):
+        runs = ctx.dataset.info.get("vllm_runs", {})
+        runs[f"judge_{ann_field}"] = {
+            "model_name": params["model"],
+            "task": "judge",
+            "annotation_field": ann_field,
+            "annotation_type": ann_type,
+        }
+        ctx.dataset.info["vllm_runs"] = runs
+
+    base_url = params.get("base_url", _DEFAULTS["base_url"])
+    api_key = params.get("api_key", _DEFAULTS["api_key"])
+    params["base_url"] = base_url
+    params["api_key"] = api_key
+    save_global_config(params)
+    ctx.dataset.info["_vllm_config"] = pick_params(params)
+    ctx.dataset.save()
+
+    if ctx.delegated:
+        store = ctx.store("vllm_status")
+        store.set("done", True)
+    else:
+        yield ctx.trigger("reload_dataset")
+
+
+def _apply_judge_tags(
+    annotation,
+    result,
+    ann_type,
+    judge,
+    img_w,
+    img_h,
+    missing_dict,
+    sample_id,
+):
+    """Apply judgment result as tags on existing annotation objects."""
+    import fiftyone as fo
+
+    from .tasks import _convert_box
+
+    if ann_type == "classification":
+        if not result.get("label_correct", True):
+            correct = result.get("correct_label", "unknown")
+            annotation.tags = list(
+                set(getattr(annotation, "tags", []) + [f"bad_label:{correct}"])
+            )
+        if result.get("top5"):
+            for lbl in result["top5"]:
+                annotation.tags = list(
+                    set(getattr(annotation, "tags", []) + [f"top5:{lbl}"])
+                )
+        return
+
+    # Detection — patch mode
+    if judge.is_patch:
+        if not result.get("label_correct", True):
+            correct = result.get("correct_label", "unknown")
+            annotation.tags = list(
+                set(getattr(annotation, "tags", []) + [f"bad_label:{correct}"])
+            )
+        if not result.get("box_correct", True):
+            annotation.tags = list(set(getattr(annotation, "tags", []) + ["fix_bbox"]))
+        return
+
+    # Detection — full image
+    detections = annotation.detections
+    for j in result.get("judgments", []):
+        idx = j.get("index")
+        if idx is None or idx < 0 or idx >= len(detections):
+            continue
+        det = detections[idx]
+        if not j.get("label_correct", True):
+            correct = j.get("correct_label", "unknown")
+            det.tags = list(set(getattr(det, "tags", []) + [f"bad_label:{correct}"]))
+        if not j.get("box_correct", True):
+            det.tags = list(set(getattr(det, "tags", []) + ["fix_bbox"]))
+
+    # Missing detections
+    if judge.check_missing and result.get("missing"):
+        missing_dets = []
+        for m in result["missing"]:
+            box = m.get("box", [])
+            if len(box) != 4:
+                continue
+            converted = _convert_box(
+                *[float(v) for v in box],
+                coordinate_format=judge.coordinate_format,
+                box_format=judge.box_format,
+                img_w=img_w,
+                img_h=img_h,
+            )
+            if converted is None:
+                continue
+            missing_dets.append(
+                fo.Detection(
+                    label=m.get("label", "object"),
+                    bounding_box=list(converted),
+                    tags=["missing"],
+                )
+            )
+        if missing_dets:
+            missing_dict[sample_id] = fo.Detections(detections=missing_dets)

@@ -26,6 +26,11 @@ _PERSIST_KEYS = [
     "image_mode",
     "coordinate_format",
     "box_format",
+    "annotation_field",
+    "is_patch",
+    "open_vocab",
+    "check_missing",
+    "top5",
 ]
 
 

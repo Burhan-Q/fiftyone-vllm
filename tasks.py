@@ -17,14 +17,20 @@ class BaseTaskConfig:
         self.prompt = prompt
 
     def build_messages(self, image_content, context=None):
-        """Build OpenAI-format messages. Optional context appended to user
-        prompt."""
+        """Build OpenAI-format messages.
+
+        If the prompt contains a ``{context}`` placeholder, *context* is
+        substituted in-place; otherwise it is appended after a blank line.
+        """
         messages = []
         if self.system_prompt:
             messages.append({"role": "system", "content": self.system_prompt})
-        text = self.prompt
-        if context:
-            text = f"{text}\n\n{context}"
+        if context and "{context}" in self.prompt:
+            text = self.prompt.format(context=context)
+        elif context:
+            text = f"{self.prompt}\n\n{context}"
+        else:
+            text = self.prompt.replace("{context}", "")
         messages.append(
             {
                 "role": "user",
@@ -41,6 +47,14 @@ class BaseTaskConfig:
 
     def parse_response(self, text, **kwargs):
         raise NotImplementedError
+
+    def build_full_prompt(self):
+        """Return a human-readable representation of the full prompt."""
+        parts = []
+        if self.system_prompt:
+            parts.append(f"[system] {self.system_prompt}")
+        parts.append(f"[user] {self.prompt}")
+        return "\n".join(parts)
 
 
 class TaskConfig(BaseTaskConfig):
@@ -430,6 +444,7 @@ class JudgeConfig(BaseTaskConfig):
         top5=False,
         coordinate_format="pixel",
         box_format="xyxy",
+        custom_instructions=None,
     ):
         self.annotation_type = annotation_type
         self.is_patch = is_patch
@@ -441,11 +456,19 @@ class JudgeConfig(BaseTaskConfig):
         self.box_format = box_format
 
         prompt = self._build_prompt()
-        super().__init__(system_prompt=self._SYSTEM_PROMPT, prompt=prompt)
+        system = self._SYSTEM_PROMPT
+        if custom_instructions:
+            system = f"{system}\n\n{custom_instructions}"
+        super().__init__(system_prompt=system, prompt=prompt)
 
     def _build_prompt(self):
         if self.open_vocab:
-            vocab = "Consider any applicable label."
+            vocab = (
+                "You are NOT limited to the labels present in the annotations."
+                " Use the most accurate and specific label based on what you"
+                " actually see in the image, even if it differs from any"
+                " existing label."
+            )
         else:
             vocab = f"Only consider these labels: {', '.join(self.ds_labels)}"
 
@@ -456,15 +479,32 @@ class JudgeConfig(BaseTaskConfig):
                 "Judge whether the label correctly describes this image."
             )
 
-        # Detection
+        # Detection — shared verdict instructions
+        verdict_block = (
+            "Step 1 — Should this annotation be REMOVED entirely?"
+            " (spurious, duplicate, does not belong)\n"
+            "If yes → verdict: remove. Do not assess label or box.\n\n"
+            "Step 2 — If NOT removed, assess label and box"
+            " independently:\n"
+            "- Is the label correct or wrong?\n"
+            "- Is the bounding box correctly placed and sized, or"
+            " not?\n"
+            "Then pick the verdict that matches:\n"
+            "  label wrong + box wrong  → bad_label_and_bbox\n"
+            "  label wrong + box fine   → bad_label\n"
+            "  label fine  + box wrong  → bad_bbox\n"
+            "  both fine                → correct\n"
+            "For bad_label or bad_label_and_bbox, set correct_label to"
+            " the right label."
+        )
+
         if self.is_patch:
             return (
-                "This is a cropped region around a single annotated object.\n"
+                "This is a cropped region around a single annotated"
+                " object.\n"
                 "{context}\n"
                 f"{vocab}\n"
-                "Judge:\n"
-                "1. Is the label correct?\n"
-                "2. Is the bounding box correctly placed and sized?"
+                f"Evaluate this annotation in two steps.\n\n{verdict_block}"
             )
 
         missing = ""
@@ -477,18 +517,16 @@ class JudgeConfig(BaseTaskConfig):
         return (
             "{context}\n"
             f"{vocab}\n"
-            "For each annotation, judge:\n"
-            "1. Is the label correct for the object in the bounding box?\n"
-            "2. Is the bounding box correctly placed and sized?"
+            "For each annotation, evaluate in two steps.\n\n"
+            f"{verdict_block}"
+            " If multiple annotations overlap the same object,"
+            " keep the best one and set the others to remove."
             f"{missing}"
         )
 
     def build_context(self, annotation, image_width=None, image_height=None):
         """Serialize annotation into text context for the prompt."""
-        if self.annotation_type == "classification":
-            return f'Current annotation: label="{annotation.label}"'
-
-        if self.is_patch:
+        if self.annotation_type == "classification" or self.is_patch:
             return f'Current annotation: label="{annotation.label}"'
 
         # Full image detection — enumerate all detections
@@ -497,23 +535,6 @@ class JudgeConfig(BaseTaskConfig):
             box = _fo_box_to_pixel_xyxy(det.bounding_box, image_width, image_height)
             lines.append(f'[{i}] label="{det.label}", box={box}')
         return "\n".join(lines)
-
-    def build_messages(self, image_content, context=None):
-        """Build messages with context inserted into prompt template."""
-        messages = []
-        if self.system_prompt:
-            messages.append({"role": "system", "content": self.system_prompt})
-        text = self.prompt.format(context=context or "")
-        messages.append(
-            {
-                "role": "user",
-                "content": [
-                    image_content,
-                    {"type": "text", "text": text},
-                ],
-            }
-        )
-        return messages
 
     def get_structured_outputs(self):
         """Return structured output schema based on annotation type and
@@ -548,21 +569,27 @@ class JudgeConfig(BaseTaskConfig):
                 }
             }
 
+        verdict_enum = {
+            "type": "string",
+            "enum": [
+                "correct",
+                "bad_label",
+                "bad_bbox",
+                "bad_label_and_bbox",
+                "remove",
+            ],
+        }
+
         # Detection — patch mode
         if self.is_patch:
             return {
                 "json": {
                     "type": "object",
                     "properties": {
-                        "label_correct": {"type": "boolean"},
+                        "verdict": verdict_enum,
                         "correct_label": label_schema,
-                        "box_correct": {"type": "boolean"},
                     },
-                    "required": [
-                        "label_correct",
-                        "correct_label",
-                        "box_correct",
-                    ],
+                    "required": ["verdict", "correct_label"],
                     "additionalProperties": False,
                 }
             }
@@ -570,9 +597,8 @@ class JudgeConfig(BaseTaskConfig):
         # Detection — full image
         judgment_props = {
             "index": {"type": "integer"},
-            "label_correct": {"type": "boolean"},
+            "verdict": verdict_enum,
             "correct_label": label_schema,
-            "box_correct": {"type": "boolean"},
         }
         props = {
             "judgments": {
@@ -580,12 +606,7 @@ class JudgeConfig(BaseTaskConfig):
                 "items": {
                     "type": "object",
                     "properties": judgment_props,
-                    "required": [
-                        "index",
-                        "label_correct",
-                        "correct_label",
-                        "box_correct",
-                    ],
+                    "required": ["index", "verdict", "correct_label"],
                     "additionalProperties": False,
                 },
             }

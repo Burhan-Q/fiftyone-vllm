@@ -208,10 +208,7 @@ class VLLMInference(foo.Operator):
         # 5b. Build metadata for optional per-label logging
         log_metadata = params.get("log_metadata", False)
         if log_metadata:
-            full_prompt = ""
-            if task.system_prompt:
-                full_prompt += f"[system] {task.system_prompt}\n"
-            full_prompt += f"[user] {task.prompt}"
+            full_prompt = task.build_full_prompt()
 
             infer_cfg = {
                 "temperature": engine.temperature,
@@ -841,7 +838,18 @@ def _advanced_settings(ctx, inputs, stored):
     )
 
     task = ctx.params.get("task")
-    if task == "detect":
+    if task in ("detect", "judge"):
+        coord_desc = (
+            "Coordinate convention for missing object boxes"
+            if task == "judge"
+            else "Bounding box coordinate convention used by the model"
+        )
+        box_desc = (
+            "Box format for missing object boxes"
+            if task == "judge"
+            else "Bounding box format produced by the model"
+        )
+
         coord_dropdown = types.Dropdown()
         coord_dropdown.add_choice("normalized_1000", label="0-1000 (Qwen default)")
         coord_dropdown.add_choice("normalized_1", label="0-1 (relative)")
@@ -852,7 +860,7 @@ def _advanced_settings(ctx, inputs, stored):
             default=stored.get("coordinate_format"),
             label="Coordinate Format",
             view=coord_dropdown,
-            description=("Bounding box coordinate convention used by the model"),
+            description=coord_desc,
         )
 
         box_dropdown = types.Dropdown()
@@ -865,38 +873,7 @@ def _advanced_settings(ctx, inputs, stored):
             default=stored.get("box_format"),
             label="Box Format",
             view=box_dropdown,
-            description="Bounding box format produced by the model",
-        )
-
-    task = ctx.params.get("task")
-    if task == "judge":
-        coord_dropdown = types.Dropdown()
-        coord_dropdown.add_choice("normalized_1000", label="0-1000 (Qwen default)")
-        coord_dropdown.add_choice("normalized_1", label="0-1 (relative)")
-        coord_dropdown.add_choice("pixel", label="Pixel coordinates")
-        inputs.enum(
-            "coordinate_format",
-            coord_dropdown.values(),
-            default=stored.get("coordinate_format"),
-            label="Coordinate Format",
-            view=coord_dropdown,
-            description=(
-                "Coordinate convention for missing object boxes"
-                " (only used when Check Missing is enabled)"
-            ),
-        )
-
-        box_dropdown = types.Dropdown()
-        box_dropdown.add_choice("xyxy", label="xyxy — corners")
-        box_dropdown.add_choice("xywh", label="xywh — origin + size")
-        box_dropdown.add_choice("cxcywh", label="cxcywh — center + size")
-        inputs.enum(
-            "box_format",
-            box_dropdown.values(),
-            default=stored.get("box_format"),
-            label="Box Format",
-            view=box_dropdown,
-            description="Box format for missing object boxes",
+            description=box_desc,
         )
 
 
@@ -1016,20 +993,58 @@ def _judge_settings(ctx, inputs, stored):
                 description=("Also identify unannotated objects in the image"),
             )
 
+    inputs.str(
+        "custom_instructions",
+        label="Custom Instructions",
+        required=False,
+        default=stored.get("custom_instructions", ""),
+        description="Additional instructions appended to the system prompt",
+    )
+
     inputs.view(
         "judge_output_header",
         types.Header(label="Output Settings", divider=True),
     )
+
+    schema = ctx.dataset.get_field_schema(flat=True)
+    base_field = f"vllm_infer_judge_{ann_field}"
+    has_existing = base_field in schema
+
+    if has_existing:
+        inputs.bool(
+            "overwrite_last",
+            label="Overwrite last result",
+            default=False,
+            view=types.SwitchView(),
+        )
+        overwrite = ctx.params.get("overwrite_last", False)
+        resolved = _resolve_field_name(ctx.dataset, f"judge_{ann_field}", overwrite)
+        prefix = "Overwriting" if overwrite else "Writing to"
+        inputs.view(
+            "judge_field_info",
+            types.Notice(label=f"{prefix}: {resolved}"),
+        )
+    else:
+        inputs.view(
+            "judge_field_info",
+            types.Notice(label=f"Writing to: {base_field}"),
+        )
+
     inputs.bool(
         "log_metadata",
         label="Log run metadata",
         default=False,
         view=types.SwitchView(),
-        description=("Store model name, prompt, and inference config in dataset info"),
+        description=(
+            "Store model name, prompt, and inference config"
+            " on each result label and in dataset info"
+        ),
     )
 
 
 # -- Judge execution --
+
+_JUDGE_TAG_PREFIXES = ("bad_label:", "fix_bbox", "remove:")
 
 
 def _execute_judge(ctx, engine, params):
@@ -1070,7 +1085,25 @@ def _execute_judge(ctx, engine, params):
             "coordinate_format", _DEFAULTS["coordinate_format"]
         ),
         box_format=params.get("box_format", _DEFAULTS["box_format"]),
+        custom_instructions=params.get("custom_instructions"),
     )
+
+    # Resolve output field for judge run marker
+    overwrite = params.get("overwrite_last", False)
+    field_name = _resolve_field_name(ctx.dataset, f"judge_{ann_field}", overwrite)
+
+    # Build metadata if requested
+    log_metadata = params.get("log_metadata", False)
+    if log_metadata:
+        full_prompt = judge.build_full_prompt()
+        infer_cfg = {
+            "temperature": engine.temperature,
+            "max_tokens": engine.max_tokens,
+            "top_p": engine.top_p,
+            "batch_size": batch_size,
+            "image_mode": image_mode,
+            "max_concurrent": engine.max_concurrent,
+        }
 
     ids = view.values("id")
     filepaths = view.values("filepath")
@@ -1091,6 +1124,25 @@ def _execute_judge(ctx, engine, params):
 
     if judge.check_missing:
         engine.temperature = params.get("temperature") or 0.0
+
+    # Strip old judge tags when overwriting
+    if overwrite:
+        for ann in annotations:
+            if ann is None:
+                continue
+            if ann_type == "classification":
+                ann.tags = [
+                    t
+                    for t in getattr(ann, "tags", [])
+                    if not any(t.startswith(p) for p in _JUDGE_TAG_PREFIXES)
+                ]
+            else:
+                for det in ann.detections:
+                    det.tags = [
+                        t
+                        for t in getattr(det, "tags", [])
+                        if not any(t.startswith(p) for p in _JUDGE_TAG_PREFIXES)
+                    ]
 
     # Process in batches
     processed = 0
@@ -1178,24 +1230,43 @@ def _execute_judge(ctx, engine, params):
             dynamic=True,
         )
 
+    # Write judge run marker (Classification) for each processed sample
+    marker_labels = {}
+    for sid in all_modified_annotations:
+        marker = fo.Classification(label="judged")
+        if log_metadata:
+            marker.model_name = params["model"]
+            marker.prompt = full_prompt
+            marker.infer_cfg = infer_cfg
+        marker_labels[sid] = marker
+
+    if marker_labels:
+        ctx.dataset.set_values(
+            field_name,
+            marker_labels,
+            key_field="id",
+            dynamic=True,
+        )
+
     # Write missing detections if any
     if all_missing_detections:
-        missing_field = _resolve_field_name(ctx.dataset, "judge_missing", False)
         ctx.dataset.set_values(
-            missing_field,
+            f"{field_name}_missing",
             all_missing_detections,
             key_field="id",
             dynamic=True,
         )
 
     # Persist config and metadata
-    if params.get("log_metadata", False):
+    if log_metadata:
         runs = ctx.dataset.info.get("vllm_runs", {})
-        runs[f"judge_{ann_field}"] = {
+        runs[field_name] = {
             "model_name": params["model"],
             "task": "judge",
             "annotation_field": ann_field,
             "annotation_type": ann_type,
+            "prompt": full_prompt,
+            "infer_cfg": infer_cfg,
         }
         ctx.dataset.info["vllm_runs"] = runs
 
@@ -1212,6 +1283,28 @@ def _execute_judge(ctx, engine, params):
         store.set("done", True)
     else:
         yield ctx.trigger("reload_dataset")
+
+
+def _apply_verdict(det, result, current_label):
+    """Map a verdict enum to detection tags."""
+    verdict = result.get("verdict", "correct")
+    if verdict == "correct":
+        return
+    tags = set(getattr(det, "tags", []))
+    if verdict == "remove":
+        tags.add(f"remove:{current_label}")
+    elif verdict == "bad_label":
+        correct = result.get("correct_label", "unknown")
+        if correct != current_label:
+            tags.add(f"bad_label:{correct}")
+    elif verdict == "bad_bbox":
+        tags.add("fix_bbox")
+    elif verdict == "bad_label_and_bbox":
+        correct = result.get("correct_label", "unknown")
+        if correct != current_label:
+            tags.add(f"bad_label:{correct}")
+        tags.add("fix_bbox")
+    det.tags = list(tags)
 
 
 def _apply_judge_tags(
@@ -1232,9 +1325,11 @@ def _apply_judge_tags(
     if ann_type == "classification":
         if not result.get("label_correct", True):
             correct = result.get("correct_label", "unknown")
-            annotation.tags = list(
-                set(getattr(annotation, "tags", []) + [f"bad_label:{correct}"])
-            )
+            # Only tag if the model actually suggests a different label
+            if correct != annotation.label:
+                annotation.tags = list(
+                    set(getattr(annotation, "tags", []) + [f"bad_label:{correct}"])
+                )
         if result.get("top5"):
             for lbl in result["top5"]:
                 annotation.tags = list(
@@ -1244,13 +1339,7 @@ def _apply_judge_tags(
 
     # Detection — patch mode
     if judge.is_patch:
-        if not result.get("label_correct", True):
-            correct = result.get("correct_label", "unknown")
-            annotation.tags = list(
-                set(getattr(annotation, "tags", []) + [f"bad_label:{correct}"])
-            )
-        if not result.get("box_correct", True):
-            annotation.tags = list(set(getattr(annotation, "tags", []) + ["fix_bbox"]))
+        _apply_verdict(annotation, result, annotation.label)
         return
 
     # Detection — full image
@@ -1259,12 +1348,7 @@ def _apply_judge_tags(
         idx = j.get("index")
         if idx is None or idx < 0 or idx >= len(detections):
             continue
-        det = detections[idx]
-        if not j.get("label_correct", True):
-            correct = j.get("correct_label", "unknown")
-            det.tags = list(set(getattr(det, "tags", []) + [f"bad_label:{correct}"]))
-        if not j.get("box_correct", True):
-            det.tags = list(set(getattr(det, "tags", []) + ["fix_bbox"]))
+        _apply_verdict(detections[idx], j, detections[idx].label)
 
     # Missing detections
     if judge.check_missing and result.get("missing"):

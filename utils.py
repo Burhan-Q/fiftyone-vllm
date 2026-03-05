@@ -31,6 +31,7 @@ _PERSIST_KEYS = [
     "open_vocab",
     "check_missing",
     "top5",
+    "custom_instructions",
 ]
 
 

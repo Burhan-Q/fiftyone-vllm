@@ -1088,6 +1088,9 @@ def _execute_judge(ctx, engine, params):
         custom_instructions=params.get("custom_instructions"),
     )
 
+    if params.get("temperature") is None:
+        engine.temperature = 0.0
+
     # Resolve output field for judge run marker
     overwrite = params.get("overwrite_last", False)
     field_name = _resolve_field_name(ctx.dataset, f"judge_{ann_field}", overwrite)
@@ -1121,9 +1124,6 @@ def _execute_judge(ctx, engine, params):
         heights = [None] * total
 
     structured_outputs = judge.get_structured_outputs()
-
-    if judge.check_missing:
-        engine.temperature = params.get("temperature") or 0.0
 
     # Strip old judge tags when overwriting
     if overwrite:

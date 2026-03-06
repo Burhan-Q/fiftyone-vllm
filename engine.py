@@ -69,7 +69,9 @@ class VLLMEngine:
                 resp = await self._aclient.chat.completions.create(
                     model=self.model,
                     messages=msgs,
-                    temperature=self.temperature,
+                    temperature=self.temperature
+                    if self.temperature is not None
+                    else 0.0,
                     max_tokens=self.max_tokens,
                     top_p=self.top_p,
                     seed=self.seed,

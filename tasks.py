@@ -431,7 +431,10 @@ class JudgeConfig(BaseTaskConfig):
     _SYSTEM_PROMPT = (
         "You are an annotation quality judge. Analyze the image and evaluate"
         " whether the provided annotations are correct. Be precise and"
-        " objective."
+        " objective. Assume annotations are correct unless there is a clear,"
+        " obvious error — only flag issues you are highly confident about."
+        " Removing an annotation should be extremely rare — only when the"
+        " annotated object is clearly absent from the image entirely."
     )
 
     def __init__(
@@ -477,23 +480,27 @@ class JudgeConfig(BaseTaskConfig):
                 "{context}\n"
                 f"{vocab}\n"
                 "Judge whether the label correctly describes this image."
+                " If the label is reasonable or approximately correct,"
+                " mark it correct. Only flag as wrong if clearly incorrect."
             )
 
         # Detection — shared verdict instructions
         verdict_block = (
-            "Step 1 — Should this annotation be REMOVED entirely?"
-            " (spurious, duplicate, does not belong)\n"
-            "If yes → verdict: remove. Do not assess label or box.\n\n"
-            "Step 2 — If NOT removed, assess label and box"
-            " independently:\n"
-            "- Is the label correct or wrong?\n"
-            "- Is the bounding box correctly placed and sized, or"
-            " not?\n"
-            "Then pick the verdict that matches:\n"
-            "  label wrong + box wrong  → bad_label_and_bbox\n"
+            "Step 1 — Assess label and bounding box quality:\n"
+            "- Is the label clearly wrong for this object?\n"
+            "- Is the bounding box significantly misplaced or"
+            " mis-sized? Minor offset is acceptable.\n\n"
+            "Step 2 — Only if the annotated object is clearly"
+            " NOT present anywhere in the image, use verdict:"
+            " remove. Do NOT remove for partial visibility,"
+            " occlusion, or minor issues.\n\n"
+            "Pick the verdict that matches:\n"
+            "  both fine                → correct\n"
             "  label wrong + box fine   → bad_label\n"
             "  label fine  + box wrong  → bad_bbox\n"
-            "  both fine                → correct\n"
+            "  label wrong + box wrong  → bad_label_and_bbox\n"
+            "  object not present       → remove\n"
+            "When in doubt, verdict: correct.\n"
             "For bad_label or bad_label_and_bbox, set correct_label to"
             " the right label."
         )
@@ -501,7 +508,9 @@ class JudgeConfig(BaseTaskConfig):
         if self.is_patch:
             return (
                 "This is a cropped region around a single annotated"
-                " object.\n"
+                " object. The object may be partially visible due to"
+                " cropping or occlusion — this is normal and is NOT"
+                " a reason to remove the annotation.\n"
                 "{context}\n"
                 f"{vocab}\n"
                 f"Evaluate this annotation in two steps.\n\n{verdict_block}"
@@ -519,8 +528,8 @@ class JudgeConfig(BaseTaskConfig):
             f"{vocab}\n"
             "For each annotation, evaluate in two steps.\n\n"
             f"{verdict_block}"
-            " If multiple annotations overlap the same object,"
-            " keep the best one and set the others to remove."
+            " If two annotations cover the exact same object instance,"
+            " keep the better one and remove the duplicate."
             f"{missing}"
         )
 

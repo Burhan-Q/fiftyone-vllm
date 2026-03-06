@@ -486,21 +486,18 @@ class JudgeConfig(BaseTaskConfig):
 
         # Detection — shared verdict instructions
         verdict_block = (
-            "Step 1 — Assess label and bounding box quality:\n"
-            "- Is the label clearly wrong for this object?\n"
-            "- Is the bounding box significantly misplaced or"
-            " mis-sized? Minor offset is acceptable.\n\n"
-            "Step 2 — Only if the annotated object is clearly"
-            " NOT present anywhere in the image, use verdict:"
-            " remove. Do NOT remove for partial visibility,"
-            " occlusion, or minor issues.\n\n"
-            "Pick the verdict that matches:\n"
-            "  both fine                → correct\n"
-            "  label wrong + box fine   → bad_label\n"
-            "  label fine  + box wrong  → bad_bbox\n"
-            "  label wrong + box wrong  → bad_label_and_bbox\n"
-            "  object not present       → remove\n"
-            "When in doubt, verdict: correct.\n"
+            "Assign EXACTLY ONE verdict per annotation.\n\n"
+            "Decision process:\n"
+            "1. Is the object completely absent from the image?"
+            " → verdict: remove (extremely rare — only when the"
+            " object is clearly not there at all)\n"
+            "2. Otherwise, assess label and bounding box:\n"
+            "   • Both acceptable → correct\n"
+            "   • Label clearly wrong, box acceptable → bad_label\n"
+            "   • Label acceptable, box significantly wrong → bad_bbox\n"
+            "   • Both clearly wrong → bad_label_and_bbox\n\n"
+            "These verdicts are MUTUALLY EXCLUSIVE — pick the single"
+            " best match. When in doubt, verdict: correct.\n"
             "For bad_label or bad_label_and_bbox, set correct_label to"
             " the right label."
         )
@@ -513,7 +510,7 @@ class JudgeConfig(BaseTaskConfig):
                 " a reason to remove the annotation.\n"
                 "{context}\n"
                 f"{vocab}\n"
-                f"Evaluate this annotation in two steps.\n\n{verdict_block}"
+                f"Evaluate this annotation.\n\n{verdict_block}"
             )
 
         missing = ""
@@ -526,7 +523,7 @@ class JudgeConfig(BaseTaskConfig):
         return (
             "{context}\n"
             f"{vocab}\n"
-            "For each annotation, evaluate in two steps.\n\n"
+            "For each annotation, assign a verdict.\n\n"
             f"{verdict_block}"
             " If two annotations cover the exact same object instance,"
             " keep the better one and remove the duplicate."

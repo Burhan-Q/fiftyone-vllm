@@ -1342,12 +1342,16 @@ def _apply_judge_tags(
         _apply_verdict(annotation, result, annotation.label)
         return
 
-    # Detection — full image
+    # Detection — full image (first verdict per index wins)
     detections = annotation.detections
+    seen = set()
     for j in result.get("judgments", []):
         idx = j.get("index")
         if idx is None or idx < 0 or idx >= len(detections):
             continue
+        if idx in seen:
+            continue
+        seen.add(idx)
         _apply_verdict(detections[idx], j, detections[idx].label)
 
     # Missing detections

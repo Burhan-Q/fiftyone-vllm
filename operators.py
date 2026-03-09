@@ -104,24 +104,17 @@ class VLLMInference(foo.Operator):
                     if missing:
                         inputs.view(
                             "json_warn",
-                            types.Warning(
-                                label="Missing required: " + ", ".join(missing)
-                            ),
+                            types.Warning(label="Missing required: " + ", ".join(missing)),
                         )
                     else:
                         inputs.view(
                             "json_ok",
-                            types.Notice(
-                                label=f"Valid: {cfg['task']} task with {cfg['model']}"
-                            ),
+                            types.Notice(label=f"Valid: {cfg['task']} task with {cfg['model']}"),
                         )
         elif config_mode == "reset":
             inputs.view(
                 "reset_notice",
-                types.Notice(
-                    label="All stored settings (global and dataset) will be"
-                    " cleared and defaults restored."
-                ),
+                types.Notice(label="All stored settings (global and dataset) will be cleared and defaults restored."),
             )
         else:
             _model_selector(ctx, inputs, stored)
@@ -262,17 +255,13 @@ class VLLMInference(foo.Operator):
             # 6d. Parse responses with per-sample error handling
             results = {}
             errors = {}
-            for sid, resp, img_w, img_h in zip(
-                batch_ids, responses, batch_widths, batch_heights
-            ):
+            for sid, resp, img_w, img_h in zip(batch_ids, responses, batch_widths, batch_heights):
                 if isinstance(resp, Exception):
                     errors[sid] = f"{type(resp).__name__}: {resp}"
                     total_errors += 1
                     continue
                 try:
-                    label = task.parse_response(
-                        resp, image_width=img_w, image_height=img_h
-                    )
+                    label = task.parse_response(resp, image_width=img_w, image_height=img_h)
                     if log_metadata:
                         label.model_name = params["model"]
                         label.prompt = full_prompt
@@ -335,9 +324,7 @@ class VLLMInference(foo.Operator):
         outputs.str("summary", label="Summary")
 
         if ctx.params.get("config_mode") != "reset":
-            cfg_json = json.dumps(
-                pick_params(ctx.params, exclude=("api_key",)), indent=2
-            )
+            cfg_json = json.dumps(pick_params(ctx.params, exclude=("api_key",)), indent=2)
             outputs.str(
                 "config_export",
                 label="Exportable Config (copy to reuse)",
@@ -435,14 +422,8 @@ def _create_engine(params, secrets):
     Returns (engine, base_url, api_key) — base_url/api_key needed for
     dataset.info persistence.
     """
-    api_key = (
-        params.get("api_key") or secrets.get("FIFTYONE_VLLM_API_KEY", None) or "EMPTY"
-    )
-    base_url = (
-        params.get("base_url")
-        or secrets.get("FIFTYONE_VLLM_BASE_URL", None)
-        or "http://localhost:8000/v1"
-    )
+    api_key = params.get("api_key") or secrets.get("FIFTYONE_VLLM_API_KEY", None) or "EMPTY"
+    base_url = params.get("base_url") or secrets.get("FIFTYONE_VLLM_BASE_URL", None) or "http://localhost:8000/v1"
 
     engine = VLLMEngine(
         model=params["model"],
@@ -468,9 +449,7 @@ def _create_task(params):
         prompt=params.get("prompt_override") or params.get("prompt"),
         system_prompt=params.get("system_prompt"),
         classes=classes,
-        coordinate_format=params.get(
-            "coordinate_format", _DEFAULTS["coordinate_format"]
-        ),
+        coordinate_format=params.get("coordinate_format", _DEFAULTS["coordinate_format"]),
         box_format=params.get("box_format", _DEFAULTS["box_format"]),
         question=params.get("question", ""),
     )
@@ -720,10 +699,7 @@ def _output_settings(ctx, inputs, task):
         label="Log run metadata",
         default=False,
         view=types.SwitchView(),
-        description=(
-            "Store model name, prompt, and inference config"
-            " on each result label and in dataset info"
-        ),
+        description=("Store model name, prompt, and inference config on each result label and in dataset info"),
     )
 
 
@@ -811,9 +787,7 @@ def _advanced_settings(ctx, inputs, stored):
     image_dropdown.add_choice(
         "filepath",
         label="File Path",
-        description=(
-            "file:// paths (local vLLM server with --allowed-local-media-path only)"
-        ),
+        description=("file:// paths (local vLLM server with --allowed-local-media-path only)"),
     )
     inputs.enum(
         "image_mode",

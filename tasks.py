@@ -15,36 +15,23 @@ class TaskConfig:
 
     TASKS = {
         "caption": {
-            "system": (
-                "You are an image captioner. Respond with a JSON object:"
-                ' {"text": "your description"}'
-            ),
+            "system": ('You are an image captioner. Respond with a JSON object: {"text": "your description"}'),
             "prompt": "Describe this image concisely.",
             "output_type": "Classification",
             "default_field": "caption",
             "default_temperature": 0.2,
         },
         "classify": {
-            "system": (
-                "You are an image classifier. Respond with exactly one class label."
-            ),
-            "system_open": (
-                "You are an image classifier. Respond with a JSON object:"
-                ' {"label": "your label"}'
-            ),
+            "system": ("You are an image classifier. Respond with exactly one class label."),
+            "system_open": ('You are an image classifier. Respond with a JSON object: {"label": "your label"}'),
             "prompt": "Classify this image. Choose exactly one: {classes}",
-            "prompt_open": (
-                "Classify this image with the single most appropriate label."
-            ),
+            "prompt_open": ("Classify this image with the single most appropriate label."),
             "output_type": "Classification",
             "default_field": "classification",
             "default_temperature": 0.0,
         },
         "tag": {
-            "system": (
-                "You are an image tagger. Respond with a JSON object:"
-                ' {"labels": ["tag1", "tag2", ...]}'
-            ),
+            "system": ('You are an image tagger. Respond with a JSON object: {"labels": ["tag1", "tag2", ...]}'),
             "prompt": ("Tag this image with all applicable labels from: {classes}"),
             "prompt_open": ("Tag this image with all applicable descriptive labels."),
             "output_type": "Classifications",
@@ -57,20 +44,14 @@ class TaskConfig:
             "default_temperature": 0.0,
         },
         "vqa": {
-            "system": (
-                "You are a visual question answerer. Respond with a JSON"
-                ' object: {"answer": "your answer"}'
-            ),
+            "system": ('You are a visual question answerer. Respond with a JSON object: {"answer": "your answer"}'),
             "prompt": "{question}",
             "output_type": "Classification",
             "default_field": "vqa_answer",
             "default_temperature": 0.2,
         },
         "ocr": {
-            "system": (
-                "You are an OCR engine. Respond with a JSON object:"
-                ' {"text": "extracted text"}'
-            ),
+            "system": ('You are an OCR engine. Respond with a JSON object: {"text": "extracted text"}'),
             "prompt": "Extract all text visible in this image.",
             "output_type": "Classification",
             "default_field": "ocr_text",
@@ -86,10 +67,7 @@ class TaskConfig:
 
     _COORD_FORMATS = {
         "normalized_1000": {
-            "desc": (
-                "0-1000 normalized coordinates where 0 is top-left"
-                " and 1000 is bottom-right"
-            ),
+            "desc": ("0-1000 normalized coordinates where 0 is top-left and 1000 is bottom-right"),
             "item_schema": {
                 "type": "integer",
                 "minimum": 0,
@@ -97,10 +75,7 @@ class TaskConfig:
             },
         },
         "normalized_1": {
-            "desc": (
-                "0-1 normalized coordinates where 0.0 is top-left"
-                " and 1.0 is bottom-right"
-            ),
+            "desc": ("0-1 normalized coordinates where 0.0 is top-left and 1.0 is bottom-right"),
             "item_schema": {
                 "type": "number",
                 "minimum": 0,
@@ -151,20 +126,14 @@ class TaskConfig:
         self.box_format = box_format
 
         if task == "detect":
-            coord = self._COORD_FORMATS.get(
-                coordinate_format, self._COORD_FORMATS["normalized_1000"]
-            )
+            coord = self._COORD_FORMATS.get(coordinate_format, self._COORD_FORMATS["normalized_1000"])
             coord_desc = coord["desc"]
             box_fmt = self._BOX_FORMATS.get(box_format, self._BOX_FORMATS["xyxy"])
             box_labels = box_fmt["labels"]
 
             default_system = (
                 "You are an object detector. Respond with a JSON object:"
-                ' {"detections": [{"label": "...", "box": '
-                + box_labels
-                + "}, ...]}. Use "
-                + coord_desc
-                + "."
+                ' {"detections": [{"label": "...", "box": ' + box_labels + "}, ...]}. Use " + coord_desc + "."
             )
             default_prompt = "Detect all objects in this image."
             default_prompt_with_classes = (
@@ -178,9 +147,7 @@ class TaskConfig:
             default_prompt = defaults.get("prompt_open" if open_ended else "prompt", "")
             default_prompt_with_classes = None
 
-        self.system_prompt = (
-            system_prompt if system_prompt is not None else default_system
-        )
+        self.system_prompt = system_prompt if system_prompt is not None else default_system
 
         if prompt is not None:
             raw_prompt = prompt
@@ -238,11 +205,7 @@ class TaskConfig:
             }
 
         if self.task == "tag":
-            items = (
-                {"type": "string", "enum": self.classes}
-                if self.classes
-                else {"type": "string"}
-            )
+            items = {"type": "string", "enum": self.classes} if self.classes else {"type": "string"}
             return {
                 "json": {
                     "type": "object",
@@ -332,16 +295,10 @@ class TaskConfig:
         data = json.loads(text)
 
         if self.output_type == "Classifications":
-            return fo.Classifications(
-                classifications=[
-                    fo.Classification(label=label) for label in data["labels"]
-                ]
-            )
+            return fo.Classifications(classifications=[fo.Classification(label=label) for label in data["labels"]])
 
         if self.output_type == "Detections":
-            return self._parse_detections(
-                data, image_width=image_width, image_height=image_height
-            )
+            return self._parse_detections(data, image_width=image_width, image_height=image_height)
 
         raise ValueError(f"Unknown output type: {self.output_type}")
 
@@ -395,9 +352,7 @@ class TaskConfig:
 _COORD_SCALE = {"normalized_1000": 1000.0, "normalized_1": 1.0}
 
 
-def _convert_box(
-    v0, v1, v2, v3, coordinate_format, box_format="xyxy", img_w=None, img_h=None
-):
+def _convert_box(v0, v1, v2, v3, coordinate_format, box_format="xyxy", img_w=None, img_h=None):
     """Convert model box output to FiftyOne [x, y, w, h] in [0, 1].
 
     Two-step pipeline:

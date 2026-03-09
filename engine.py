@@ -77,9 +77,7 @@ class VLLMEngine:
                 )
                 return resp.choices[0].message.content
 
-        results = await asyncio.gather(
-            *[_call(m) for m in messages], return_exceptions=True
-        )
+        results = await asyncio.gather(*[_call(m) for m in messages], return_exceptions=True)
         return list(results)
 
 

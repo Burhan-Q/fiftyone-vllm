@@ -434,7 +434,7 @@ class JudgeConfig(BaseTaskConfig):
         " objective. Assume annotations are correct unless there is a clear,"
         " obvious error — only flag issues you are highly confident about."
         " Removing an annotation should be extremely rare — only when the"
-        " annotated object is clearly absent from the image entirely."
+        " labeled object clearly does not exist at the annotated location."
     )
 
     def __init__(
@@ -486,18 +486,29 @@ class JudgeConfig(BaseTaskConfig):
 
         # Detection — shared verdict instructions
         verdict_block = (
-            "Assign EXACTLY ONE verdict per annotation.\n\n"
-            "Decision process:\n"
-            "1. Is the object completely absent from the image?"
-            " → verdict: remove (extremely rare — only when the"
-            " object is clearly not there at all)\n"
-            "2. Otherwise, assess label and bounding box:\n"
-            "   • Both acceptable → correct\n"
-            "   • Label clearly wrong, box acceptable → bad_label\n"
-            "   • Label acceptable, box significantly wrong → bad_bbox\n"
-            "   • Both clearly wrong → bad_label_and_bbox\n\n"
-            "These verdicts are MUTUALLY EXCLUSIVE — pick the single"
-            " best match. When in doubt, verdict: correct.\n"
+            "Judge each annotation INDEPENDENTLY — the verdict for"
+            " one must not influence any other.\n\n"
+            "Assign EXACTLY ONE verdict per annotation:\n"
+            "  • correct — the label accurately describes what is"
+            " visible at the annotated location, and the box"
+            " reasonably encloses the object\n"
+            "  • bad_label — the object at the annotated location"
+            " is clearly a different type than the label states,"
+            " but the box is acceptable\n"
+            "  • bad_bbox — the label accurately represents the"
+            " object, but the box does not correctly enclose the"
+            " object at its visual boundaries. Minor offset or"
+            " loose padding is acceptable.\n"
+            "  • bad_label_and_bbox — both the label and box are"
+            " wrong as defined above\n"
+            "  • remove — the annotated location does not contain"
+            " an object that can be assigned a correct label."
+            " Extremely rare.\n\n"
+            "An object is PRESENT if there is ANY visual evidence of it"
+            " at the annotated location — even if small, distant,"
+            " partially occluded, truncated, blurry, or difficult to"
+            " see. Present objects must NEVER be removed.\n\n"
+            "When in doubt, verdict: correct.\n"
             "For bad_label or bad_label_and_bbox, set correct_label to"
             " the right label."
         )
@@ -525,8 +536,6 @@ class JudgeConfig(BaseTaskConfig):
             f"{vocab}\n"
             "For each annotation, assign a verdict.\n\n"
             f"{verdict_block}"
-            " If two annotations cover the exact same object instance,"
-            " keep the better one and remove the duplicate."
             f"{missing}"
         )
 

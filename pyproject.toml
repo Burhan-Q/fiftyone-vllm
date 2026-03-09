@@ -82,8 +82,8 @@ select = [
     
 ]
 ignore = [
-    "ANN002"  # no *args type hints
-    "ANN003"  # no **kwargs type hints
+    "ANN002",  # no *args type hints
+    "ANN003",  # no **kwargs type hints
     "D202",  # no blank line after function
     "D203",  # no blank line after class
     "D212",  # allow multi-line docstring after 1st line

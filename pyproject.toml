@@ -7,3 +7,87 @@ dependencies = [
     "openai>=1.0",
     "pillow>=9.0",
 ]
+
+[tool.ruff]
+line-length = 120
+indent-width = 4
+
+# Exclude a variety of commonly ignored directories.
+exclude = [
+    ".bzr",
+    ".direnv",
+    ".eggs",
+    ".git",
+    ".git-rewrite",
+    ".hg",
+    ".ipynb_checkpoints",
+    ".mypy_cache",
+    ".nox",
+    ".pants.d",
+    ".pyenv",
+    ".pytest_cache",
+    ".pytype",
+    ".ruff_cache",
+    ".svn",
+    ".tox",
+    ".venv",
+    ".vscode",
+    "__pypackages__",
+    "_build",
+    "buck-out",
+    "build",
+    "dist",
+    "node_modules",
+    "site-packages",
+    "venv",
+]
+
+[tool.ruff.format]
+docstring-code-format = true
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.pycodestyle]
+max-doc-length = 120
+
+[tool.ruff.lint]
+# Enable Pyflakes (`F`) and a subset of the pycodestyle (`E`) codes by default.
+# Unlike Flake8, Ruff doesn't enable pycodestyle warnings (`W`) or
+# McCabe complexity (`C901`) by default.
+select = [
+    "A",  # flake8-builtins
+    "ANN",  # flake8-annotations
+    "ARG",  # flake8-unused-arguments
+    # "ASYNC",  # flake8-async
+    "DTZ003",  # avoid deprecated datetime.utcnow()
+    "DOC",  # pydoclint
+    "E4",
+    "E7",
+    "E9",
+    "F",
+    "NPY",  # Numpy linting
+    "PD",  # pandas-vet linting
+    "PLC",  # pylint-convention
+    "PTH",  # flake8-use-pathlib
+    "PLR",  # pyliht-refactor
+    "RET502",  # no bare return
+    "SIM",  # flake8-simplify
+    "T20",  # flake8-print
+    "UP006",  # Python 3.9 or later
+    "UP007",  # Python 3.10 or later
+    
+]
+ignore = [
+    "D202",  # no blank line after function
+    "D203",  # no blank line after class
+    "D212",  # allow multi-line docstring after 1st line
+    "D401",  # allow non-imperative-mood
+]
+
+[tool.ruff.lint.pylint]
+max-branches = 6
+max-returns = 5  # prefer fewest return statements

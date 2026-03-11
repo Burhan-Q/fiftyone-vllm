@@ -20,6 +20,7 @@ from .tasks import DetectionConfig, TaskConfig
 from .utils import (
     build_image_contents,
     clear_global_config,
+    default_max_image_dim,
     get_global_config,
     normalize_classes,
     parse_config_json,
@@ -63,6 +64,7 @@ class _InferenceContext:
     batch_size: int
     image_mode: str
     max_workers: int
+    max_image_dim: int | None
     log_metadata: bool
     metadata: dict[str, object] | None
 
@@ -271,6 +273,10 @@ def _prepare_inference(
 
     engine.temperature = params.get("temperature") or task.default_temperature or 0.1
 
+    user_max_dim = params.get("max_image_dim")
+    max_image_dim = int(user_max_dim) if user_max_dim is not None else default_max_image_dim(engine.max_model_len)
+    params["max_image_dim"] = max_image_dim
+
     batch_size = params.get("batch_size", _DEFAULTS["batch_size"])
     image_mode = params.get("image_mode", _DEFAULTS["image_mode"])
     max_workers = params.get("max_workers", _DEFAULTS["max_workers"])
@@ -311,6 +317,7 @@ def _prepare_inference(
         batch_size=batch_size,
         image_mode=image_mode,
         max_workers=max_workers,
+        max_image_dim=max_image_dim,
         log_metadata=log_metadata,
         metadata=metadata,
     )
@@ -336,6 +343,7 @@ def _process_batches(
             batch_paths,
             image_mode=inf.image_mode,
             max_workers=inf.max_workers,
+            max_image_dim=inf.max_image_dim,
         )
         batch_messages = [inf.task.build_messages(img) for img in image_contents]
         responses = inf.engine.infer_batch(batch_messages, structured_outputs=inf.structured_outputs)
@@ -454,6 +462,7 @@ def _build_metadata(
             "coordinate_format": task.coordinate_format,
             "box_format": task.box_format,
             "image_mode": image_mode,
+            "max_image_dim": params.get("max_image_dim"),
             "max_concurrent": engine.max_concurrent,
         },
     }
@@ -909,6 +918,16 @@ def _advanced_settings(
         default=stored.get("image_mode"),
         label="Image Mode",
         view=image_dropdown,
+    )
+    inputs.int(
+        "max_image_dim",
+        label="Max Image Dimension",
+        default=stored.get("max_image_dim"),
+        min=256,
+        max=4096,
+        description=(
+            "Max pixel size for longest image side (auto-detected from model context length if empty; local files only)"
+        ),
     )
 
     task = ctx.params.get("task")

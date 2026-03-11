@@ -50,6 +50,7 @@ class VLLMEngine:
         self.top_p = config.top_p
         self.seed = config.seed
         self.max_concurrent = config.max_concurrent
+        self.max_model_len: int | None = None
         self._aclient = AsyncOpenAI(base_url=config.base_url, api_key=config.api_key)
         self._sync_client: OpenAI | None = None
 
@@ -60,10 +61,17 @@ class VLLMEngine:
         return [m.id for m in self._sync_client.models.list().data]
 
     def validate_connection(self) -> None:
-        """Test server connectivity. Raises on failure."""
-        models = self.list_models()
-        if not models:
+        """Test server connectivity and extract model metadata."""
+        if self._sync_client is None:
+            self._sync_client = OpenAI(base_url=self.base_url, api_key=self.api_key)
+        data = self._sync_client.models.list().data
+        if not data:
             raise ConnectionError("vLLM server returned no models")
+        for m in data:
+            if m.id == self.model:
+                extra = getattr(m, "model_extra", None) or {}
+                self.max_model_len = extra.get("max_model_len")
+                break
 
     def infer_batch(
         self,

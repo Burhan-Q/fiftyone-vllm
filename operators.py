@@ -36,6 +36,9 @@ if TYPE_CHECKING:
 
     import fiftyone as fo
 
+_FIELD_PREFIX = "vllm_infer_"
+_ERROR_SUFFIX = "_error"
+
 _DEFAULTS: dict[str, object] = {
     "base_url": "http://localhost:8000/v1",
     "api_key": "EMPTY",
@@ -68,7 +71,6 @@ class _InferenceContext:
     image_mode: str
     max_workers: int
     max_image_dim: int | None
-    log_metadata: bool
     metadata: dict[str, object] | None
 
 
@@ -333,19 +335,39 @@ def _prepare_inference(
         image_mode=image_mode,
         max_workers=max_workers,
         max_image_dim=max_image_dim,
-        log_metadata=log_metadata,
         metadata=metadata,
     )
     return inf, None
 
 
-def _submit_encode(pool: ThreadPoolExecutor, inf: _InferenceContext, start: int) -> Future | None:
-    """Submit image encoding for a batch slice, or return None past the end."""
+def _prefetch_encode(
+    pool: ThreadPoolExecutor,
+    inf: _InferenceContext,
+    start: int,
+) -> Future | None:
+    """Submit next batch's image encoding to the pool, or None past the end."""
     if start >= len(inf.ids):
         return None
     paths = inf.filepaths[start : start + inf.batch_size]
     return pool.submit(
         build_image_contents,
+        paths,
+        image_mode=inf.image_mode,
+        max_image_dim=inf.max_image_dim,
+        executor=pool,
+    )
+
+
+def _encode_batch_images(
+    pool: ThreadPoolExecutor,
+    inf: _InferenceContext,
+    paths: list[str],
+    pending: Future | None,
+) -> list:
+    """Return encoded images: from a prefetch future, or encode directly."""
+    if pending is not None:
+        return pending.result()
+    return build_image_contents(
         paths,
         image_mode=inf.image_mode,
         max_image_dim=inf.max_image_dim,
@@ -363,25 +385,24 @@ def _process_batches(
     encoded in a background thread while the current batch's API call is
     in flight, hiding encoding latency after the first batch.
     """
-
     total = len(inf.ids)
     processed = 0
     total_errors = 0
 
     with ThreadPoolExecutor(max_workers=inf.max_workers) as pool:
-        pending = _submit_encode(pool, inf, 0)
+        pending: Future | None = None
 
         for i in range(0, total, inf.batch_size):
             batch_ids = inf.ids[i : i + inf.batch_size]
+            batch_paths = inf.filepaths[i : i + inf.batch_size]
             batch_widths = inf.widths[i : i + inf.batch_size]
             batch_heights = inf.heights[i : i + inf.batch_size]
 
-            image_contents = pending.result()
+            image_contents = _encode_batch_images(pool, inf, batch_paths, pending)
 
-            # Submit next batch encoding BEFORE starting API call
-            pending = _submit_encode(pool, inf, i + inf.batch_size)
+            # Prefetch next batch while API call runs
+            pending = _prefetch_encode(pool, inf, i + inf.batch_size)
 
-            # API call runs while next batch encodes in background
             batch_messages = [inf.task.build_messages(img) for img in image_contents]
             responses = inf.engine.infer_batch(batch_messages, structured_outputs=inf.structured_outputs)
 
@@ -413,7 +434,7 @@ def _finalize_run(
     params: dict[str, object],
 ) -> Generator[object, None, None]:
     """Persist run metadata, save config, and notify/reload."""
-    if inf.log_metadata and inf.metadata:
+    if inf.metadata:
         runs = ctx.dataset.info.get("vllm_runs", {})
         runs[inf.field_name] = inf.metadata
         ctx.dataset.info["vllm_runs"] = runs
@@ -443,6 +464,11 @@ def _error(ctx: ExecutionContext, message: str) -> object:
     return ctx.trigger("set_progress", {"progress": 0, "label": label})
 
 
+def _fmt_error(exc: Exception) -> str:
+    """Format an exception as 'TypeName: message'."""
+    return f"{type(exc).__name__}: {exc}"
+
+
 def _parse_batch_responses(
     inf: _InferenceContext,
     batch_ids: list[str],
@@ -460,18 +486,18 @@ def _parse_batch_responses(
     error_count = 0
     for sid, resp, img_w, img_h in zip(batch_ids, responses, batch_widths, batch_heights):
         if isinstance(resp, Exception):
-            errors[sid] = f"{type(resp).__name__}: {resp}"
+            errors[sid] = _fmt_error(resp)
             error_count += 1
             continue
         try:
             label = inf.task.parse_response(resp, image_width=img_w, image_height=img_h)
-            if inf.log_metadata and inf.metadata:
+            if inf.metadata:
                 label.model_name = inf.metadata["model_name"]
                 label.prompt = inf.metadata["prompt"]
                 label.infer_cfg = inf.metadata["infer_cfg"]
             results[sid] = label
         except Exception as e:
-            errors[sid] = f"{type(e).__name__}: {e}"
+            errors[sid] = _fmt_error(e)
             error_count += 1
     return results, errors, error_count
 
@@ -514,7 +540,7 @@ def _clear_stale_errors(
     """Clear stale error fields when overwriting previous results."""
     if not overwrite:
         return
-    error_field = f"{field_name}_error"
+    error_field = f"{field_name}{_ERROR_SUFFIX}"
     schema = dataset.get_field_schema(flat=True)
     if error_field in schema:
         dataset.set_values(error_field, {sid: None for sid in ids}, key_field="id")
@@ -591,7 +617,7 @@ def _resolve_field_name(
             instead of incrementing.
     """
     schema = dataset.get_field_schema(flat=True)
-    base = f"vllm_infer_{task_name}"
+    base = f"{_FIELD_PREFIX}{task_name}"
 
     if base not in schema:
         return base
@@ -629,7 +655,7 @@ def _write_batch_results(
         )
     if errors:
         dataset.set_values(
-            f"{field_name}_error",
+            f"{field_name}{_ERROR_SUFFIX}",
             errors,
             key_field="id",
             dynamic=True,
@@ -833,7 +859,7 @@ def _output_settings(
     )
 
     schema = ctx.dataset.get_field_schema(flat=True)
-    base_field = f"vllm_infer_{task}"
+    base_field = f"{_FIELD_PREFIX}{task}"
     has_existing = base_field in schema
 
     if has_existing:

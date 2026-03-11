@@ -156,17 +156,20 @@ def _resize_and_encode_base64(filepath: str, max_dim: int) -> ContentPart:
         return _encode_base64(filepath)
 
     # Slow path: full decode, optional rotate/resize, re-encode
-    img = ImageOps.exif_transpose(img)
-    if needs_resize:
-        img.thumbnail((max_dim, max_dim), Image.BILINEAR)
-    buf = BytesIO()
-    if img.mode == "RGBA":
-        fmt, mime = "PNG", "image/png"
-    else:
-        if img.mode not in ("RGB", "L"):
-            img = img.convert("RGB")
-        fmt, mime = "JPEG", "image/jpeg"
-    img.save(buf, format=fmt, quality=85)
+    try:
+        img = ImageOps.exif_transpose(img)
+        if needs_resize:
+            img.thumbnail((max_dim, max_dim), Image.BILINEAR)
+        buf = BytesIO()
+        if img.mode == "RGBA":
+            fmt, mime = "PNG", "image/png"
+        else:
+            if img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+            fmt, mime = "JPEG", "image/jpeg"
+        img.save(buf, format=fmt, quality=85)
+    finally:
+        img.close()
     b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
     return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
 

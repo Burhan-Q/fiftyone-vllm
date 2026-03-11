@@ -1,13 +1,22 @@
 """FiftyOne operator for vLLM inference: UI, batching, progress, and result
 storage."""
 
+from __future__ import annotations
+
+import asyncio
 import json
+from collections.abc import Generator
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import fiftyone.operators as foo
 from fiftyone.operators import types
+from fiftyone.operators.store.notification_service import (
+    default_notification_service,
+)
 
-from .engine import VLLMEngine
-from .tasks import TaskConfig
+from .engine import EngineConfig, VLLMEngine
+from .tasks import DetectionConfig, TaskConfig
 from .utils import (
     build_image_contents,
     clear_global_config,
@@ -18,7 +27,12 @@ from .utils import (
     save_global_config,
 )
 
-_DEFAULTS = {
+if TYPE_CHECKING:
+    from fiftyone.operators.executor import ExecutionContext
+
+    import fiftyone as fo
+
+_DEFAULTS: dict[str, object] = {
     "base_url": "http://localhost:8000/v1",
     "api_key": "EMPTY",
     "batch_size": 8,
@@ -32,9 +46,33 @@ _DEFAULTS = {
 }
 
 
+@dataclass
+class _InferenceContext:
+    """Bundled state for a single inference run, passed between execute phases."""
+
+    engine: VLLMEngine
+    task: TaskConfig
+    base_url: str
+    api_key: str
+    field_name: str
+    ids: list[str]
+    filepaths: list[str]
+    widths: list[int | None]
+    heights: list[int | None]
+    structured_outputs: dict[str, object]
+    batch_size: int
+    image_mode: str
+    max_workers: int
+    log_metadata: bool
+    metadata: dict[str, object] | None
+
+
 class VLLMInference(foo.Operator):
+    """Run vLLM inference on a FiftyOne dataset."""
+
     @property
-    def config(self):
+    def config(self) -> foo.OperatorConfig:
+        """Return operator configuration."""
         return foo.OperatorConfig(
             name="run_vllm_inference",
             label="Run vLLM Inference",
@@ -45,7 +83,8 @@ class VLLMInference(foo.Operator):
             default_choice_to_delegated=True,
         )
 
-    def resolve_input(self, ctx):
+    def resolve_input(self, ctx: ExecutionContext) -> types.Property:
+        """Build the operator input form."""
         inputs = types.Object()
 
         if not ctx.dataset:
@@ -54,7 +93,6 @@ class VLLMInference(foo.Operator):
 
         stored = _resolve_config(ctx)
 
-        # Config mode selector
         mode_radio = types.RadioGroup(orientation="horizontal")
         mode_radio.add_choice("manual", label="Configure manually")
         mode_radio.add_choice("json", label="Paste JSON config")
@@ -69,58 +107,17 @@ class VLLMInference(foo.Operator):
         config_mode = ctx.params.get("config_mode", "manual")
 
         if config_mode == "json":
-            inputs.str(
-                "config_json",
-                label="Paste JSON Config",
-                required=True,
-                description="Paste a config exported from a previous run",
-                view=types.CodeView(language="json"),
-            )
-            inputs.bool(
-                "show_params",
-                label="Show accepted parameters",
-                default=False,
-                view=types.SwitchView(),
-            )
-            if ctx.params.get("show_params"):
-                inputs.md(
-                    "**Server:** `model`, `base_url`\n\n"
-                    "**Task:** `task`, `classes`, `question`, `prompt`, "
-                    "`system_prompt`, `prompt_override`\n\n"
-                    "**Advanced:** `temperature`, `max_tokens`, `top_p`, "
-                    "`seed`, `batch_size`, `max_concurrent`, `max_workers`, "
-                    "`image_mode`, `coordinate_format`, `box_format`",
-                    name="params_ref",
-                )
-            raw = ctx.params.get("config_json")
-            if raw:
-                cfg, err = parse_config_json(raw)
-                if err:
-                    inputs.view("json_err", types.Error(label=err))
-                else:
-                    missing = [k for k in ("model", "task") if not cfg.get(k)]
-                    if cfg.get("task") == "vqa" and not cfg.get("question"):
-                        missing.append("question")
-                    if missing:
-                        inputs.view(
-                            "json_warn",
-                            types.Warning(label="Missing required: " + ", ".join(missing)),
-                        )
-                    else:
-                        inputs.view(
-                            "json_ok",
-                            types.Notice(label=f"Valid: {cfg['task']} task with {cfg['model']}"),
-                        )
+            _json_config_inputs(ctx, inputs)
         elif config_mode == "reset":
             inputs.view(
                 "reset_notice",
                 types.Notice(label="All stored settings (global and dataset) will be cleared and defaults restored."),
             )
         else:
-            _model_selector(ctx, inputs, stored)
-            _server_settings(ctx, inputs, stored)
+            _model_selector(inputs, stored)
+            _server_settings(inputs, stored)
             task = _task_selector(ctx, inputs, stored)
-            _task_settings(ctx, inputs, task, stored)
+            _task_settings(inputs, task, stored)
             _output_settings(ctx, inputs, task)
             _advanced_settings(ctx, inputs, stored)
 
@@ -129,197 +126,35 @@ class VLLMInference(foo.Operator):
 
         return types.Property(inputs, view=types.View(label="vLLM Inference"))
 
-    def resolve_delegation(self, ctx):
+    def resolve_delegation(self, ctx: ExecutionContext) -> bool | None:
+        """Resolve whether execution should be delegated."""
         return ctx.params.get("delegate", None)
 
-    def execute(self, ctx):
+    def execute(self, ctx: ExecutionContext) -> Generator[object, None, None]:
+        """Run vLLM inference on the target dataset view."""
         params = ctx.params
-        config_mode = params.get("config_mode", "manual")
+        mode = params.get("config_mode", "manual")
 
-        # Handle reset mode — clear all stored configs
-        if config_mode == "reset":
-            clear_global_config()
-            ctx.dataset.info.pop("_vllm_config", None)
-            ctx.dataset.save()
-            if not ctx.delegated:
-                yield ctx.trigger("reload_dataset")
+        if mode == "reset":
+            yield from _handle_reset(ctx)
             return
 
-        # Handle JSON paste mode — merge imported config into params
-        if config_mode == "json":
-            raw = params.get("config_json") or ""
-            cfg, err = parse_config_json(raw)
+        if mode == "json":
+            err = _handle_json_import(params)
             if err:
-                yield _error(ctx, f"Config import failed: {err}")
-                return
-            params.update(cfg)
-            if not params.get("model") or not params.get("task"):
-                yield _error(ctx, "Config missing required 'model' or 'task'")
+                yield _error(ctx, err)
                 return
 
-        try:
-            engine, base_url, api_key = _create_engine(params, ctx.secrets)
-            task = _create_task(params)
-        except Exception as e:
-            yield _error(ctx, str(e))
+        inf, err = _prepare_inference(ctx, params)
+        if err:
+            yield _error(ctx, err)
             return
 
-        if params.get("temperature") is None:
-            engine.temperature = task.default_temperature
+        yield from _process_batches(ctx, inf)
+        yield from _finalize_run(ctx, inf, params)
 
-        batch_size = params.get("batch_size", _DEFAULTS["batch_size"])
-        image_mode = params.get("image_mode", _DEFAULTS["image_mode"])
-
-        # 5. Get target samples and resolve output field
-        view = ctx.target_view()
-        ids = view.values("id")
-        filepaths = view.values("filepath")
-        total = len(ids)
-        max_workers = params.get("max_workers", _DEFAULTS["max_workers"])
-
-        structured_outputs = task.get_structured_outputs()
-
-        # 5a. Resolve output field name (vllm_infer_caption, ...)
-        field_name = _resolve_field_name(
-            ctx.dataset,
-            params["task"],
-            params.get("overwrite_last", False),
-        )
-
-        # 5b. Build metadata for optional per-label logging
-        log_metadata = params.get("log_metadata", False)
-        if log_metadata:
-            full_prompt = ""
-            if task.system_prompt:
-                full_prompt += f"[system] {task.system_prompt}\n"
-            full_prompt += f"[user] {task.prompt}"
-
-            infer_cfg = {
-                "temperature": engine.temperature,
-                "max_tokens": engine.max_tokens,
-                "top_p": engine.top_p,
-                "batch_size": batch_size,
-                "coordinate_format": task.coordinate_format,
-                "box_format": task.box_format,
-                "image_mode": image_mode,
-                "max_concurrent": engine.max_concurrent,
-            }
-
-        # 5c. Clear stale error fields when overwriting
-        if params.get("overwrite_last", False):
-            error_field = f"{field_name}_error"
-            schema = ctx.dataset.get_field_schema(flat=True)
-            if error_field in schema:
-                ctx.dataset.set_values(
-                    error_field,
-                    {sid: None for sid in ids},
-                    key_field="id",
-                )
-
-        # 5d. Collect image dimensions for pixel coordinate normalization
-        need_dims = task.task == "detect" and task.coordinate_format == "pixel"
-        if need_dims:
-            view.compute_metadata()
-            widths = view.values("metadata.width")
-            heights = view.values("metadata.height")
-        else:
-            widths = [None] * total
-            heights = [None] * total
-
-        # 6. Process in batches
-        processed = 0
-        total_errors = 0
-
-        for i in range(0, total, batch_size):
-            batch_ids = ids[i : i + batch_size]
-            batch_paths = filepaths[i : i + batch_size]
-            batch_widths = widths[i : i + batch_size]
-            batch_heights = heights[i : i + batch_size]
-
-            # 6a. Parallel image content construction
-            image_contents = build_image_contents(
-                batch_paths,
-                image_mode=image_mode,
-                max_workers=max_workers,
-            )
-
-            # 6b. Build messages for each image
-            batch_messages = [task.build_messages(img) for img in image_contents]
-
-            # 6c. Batch inference with structured output
-            responses = engine.infer_batch(
-                batch_messages,
-                structured_outputs=structured_outputs,
-            )
-
-            # 6d. Parse responses with per-sample error handling
-            results = {}
-            errors = {}
-            for sid, resp, img_w, img_h in zip(batch_ids, responses, batch_widths, batch_heights):
-                if isinstance(resp, Exception):
-                    errors[sid] = f"{type(resp).__name__}: {resp}"
-                    total_errors += 1
-                    continue
-                try:
-                    label = task.parse_response(resp, image_width=img_w, image_height=img_h)
-                    if log_metadata:
-                        label.model_name = params["model"]
-                        label.prompt = full_prompt
-                        label.infer_cfg = infer_cfg
-                    results[sid] = label
-                except Exception as e:
-                    errors[sid] = f"{type(e).__name__}: {e}"
-                    total_errors += 1
-
-            # 6e. Bulk-write results and errors as flat fields
-            _write_batch_results(
-                ctx.dataset,
-                field_name,
-                results,
-                errors,
-            )
-
-            # 6f. Progress
-            processed += len(batch_ids)
-            label = f"{processed}/{total} samples"
-            if total_errors:
-                label += f" ({total_errors} errors)"
-
-            if ctx.delegated:
-                ctx.set_progress(progress=processed / total, label=label)
-            else:
-                yield ctx.trigger(
-                    "set_progress",
-                    dict(progress=processed / total, label=label),
-                )
-
-        # 7. Persist run metadata and settings
-        if log_metadata:
-            runs = ctx.dataset.info.get("vllm_runs", {})
-            runs[field_name] = {
-                "model_name": params["model"],
-                "prompt": full_prompt,
-                "infer_cfg": infer_cfg,
-            }
-            ctx.dataset.info["vllm_runs"] = runs
-
-        # Persist full config to both tiers
-        params["base_url"] = base_url
-        params["api_key"] = api_key
-        save_global_config(params)
-        ctx.dataset.info["_vllm_config"] = pick_params(params)
-        ctx.dataset.save()
-
-        # 8. Notify / reload
-        if ctx.delegated:
-            # Signal the store so CheckVLLMStatus (running in the App
-            # process) is woken up via the change-stream notification.
-            store = ctx.store("vllm_status")
-            store.set("done", True)
-        else:
-            yield ctx.trigger("reload_dataset")
-
-    def resolve_output(self, ctx):
+    def resolve_output(self, ctx: ExecutionContext) -> types.Property:
+        """Build the operator output display."""
         outputs = types.Object()
         outputs.str("summary", label="Summary")
 
@@ -345,7 +180,8 @@ class CheckVLLMStatus(foo.Operator):
     """
 
     @property
-    def config(self):
+    def config(self) -> foo.OperatorConfig:
+        """Return operator configuration."""
         return foo.OperatorConfig(
             name="check_vllm_status",
             label="Check vLLM Status",
@@ -354,20 +190,16 @@ class CheckVLLMStatus(foo.Operator):
             unlisted=True,
         )
 
-    async def execute(self, ctx):
-        import asyncio
-
-        from fiftyone.operators.store.notification_service import (
-            default_notification_service,
-        )
-
+    async def execute(self, ctx: ExecutionContext) -> Generator[object, None, None]:
+        """Listen for delegated inference completion and notify the user."""
         if not ctx.dataset:
             return
 
         loop = asyncio.get_running_loop()
         event = asyncio.Event()
 
-        def _on_change(_message):
+        def _on_change(_message: object) -> None:
+            """Signal the event when a store change is detected."""
             loop.call_soon_threadsafe(event.set)
 
         sub_id = default_notification_service.subscribe(
@@ -396,10 +228,168 @@ class CheckVLLMStatus(foo.Operator):
             default_notification_service.unsubscribe(sub_id)
 
 
+# -- Execute phase helpers --
+
+
+def _handle_reset(ctx: ExecutionContext) -> Generator[object, None, None]:
+    """Reset mode: clear all stored configs and reload the dataset."""
+    clear_global_config()
+    ctx.dataset.info.pop("_vllm_config", None)
+    ctx.dataset.save()
+    if not ctx.delegated:
+        yield ctx.trigger("reload_dataset")
+
+
+def _handle_json_import(params: dict[str, object]) -> str | None:
+    """Parse JSON config and merge into params in place.
+
+    Returns an error string on failure, None on success.
+    """
+    raw = params.get("config_json") or ""
+    cfg, err = parse_config_json(raw)
+    if err:
+        return f"Config import failed: {err}"
+    params.update(cfg)
+    if not params.get("model") or not params.get("task"):
+        return "Config missing required 'model' or 'task'"
+    return None
+
+
+def _prepare_inference(
+    ctx: ExecutionContext,
+    params: dict[str, object],
+) -> tuple[_InferenceContext | None, str | None]:
+    """Build engine, task, and collect sample data for inference.
+
+    Returns (context, None) on success or (None, error_message) on failure.
+    """
+    try:
+        engine, base_url, api_key = _create_engine(params, ctx.secrets)
+        task = _create_task(params)
+    except Exception as e:
+        return None, str(e)
+
+    engine.temperature = params.get("temperature") or task.default_temperature or 0.1
+
+    batch_size = params.get("batch_size", _DEFAULTS["batch_size"])
+    image_mode = params.get("image_mode", _DEFAULTS["image_mode"])
+    max_workers = params.get("max_workers", _DEFAULTS["max_workers"])
+
+    view = ctx.target_view()
+    ids = view.values("id")
+    filepaths = view.values("filepath")
+    total = len(ids)
+
+    structured_outputs = task.get_structured_outputs()
+    field_name = _resolve_field_name(ctx.dataset, params["task"], params.get("overwrite_last", False))
+
+    log_metadata = params.get("log_metadata", False)
+    metadata = _build_metadata(params, engine, task, batch_size, image_mode) if log_metadata else None
+
+    _clear_stale_errors(ctx.dataset, field_name, ids, params.get("overwrite_last", False))
+
+    need_dims = task.task == "detect" and task.coordinate_format == "pixel"
+    if need_dims:
+        view.compute_metadata()
+        widths = view.values("metadata.width")
+        heights = view.values("metadata.height")
+    else:
+        widths = [None] * total
+        heights = [None] * total
+
+    inf = _InferenceContext(
+        engine=engine,
+        task=task,
+        base_url=base_url,
+        api_key=api_key,
+        field_name=field_name,
+        ids=ids,
+        filepaths=filepaths,
+        widths=widths,
+        heights=heights,
+        structured_outputs=structured_outputs,
+        batch_size=batch_size,
+        image_mode=image_mode,
+        max_workers=max_workers,
+        log_metadata=log_metadata,
+        metadata=metadata,
+    )
+    return inf, None
+
+
+def _process_batches(
+    ctx: ExecutionContext,
+    inf: _InferenceContext,
+) -> Generator[object, None, None]:
+    """Run batch inference loop with progress reporting."""
+    total = len(inf.ids)
+    processed = 0
+    total_errors = 0
+
+    for i in range(0, total, inf.batch_size):
+        batch_ids = inf.ids[i : i + inf.batch_size]
+        batch_paths = inf.filepaths[i : i + inf.batch_size]
+        batch_widths = inf.widths[i : i + inf.batch_size]
+        batch_heights = inf.heights[i : i + inf.batch_size]
+
+        image_contents = build_image_contents(
+            batch_paths,
+            image_mode=inf.image_mode,
+            max_workers=inf.max_workers,
+        )
+        batch_messages = [inf.task.build_messages(img) for img in image_contents]
+        responses = inf.engine.infer_batch(batch_messages, structured_outputs=inf.structured_outputs)
+
+        results, errors, batch_errors = _parse_batch_responses(
+            inf,
+            batch_ids,
+            responses,
+            batch_widths,
+            batch_heights,
+        )
+        total_errors += batch_errors
+
+        _write_batch_results(ctx.dataset, inf.field_name, results, errors)
+
+        processed += len(batch_ids)
+        progress_label = f"{processed}/{total} samples"
+        if total_errors:
+            progress_label += f" ({total_errors} errors)"
+
+        if ctx.delegated:
+            ctx.set_progress(progress=processed / total, label=progress_label)
+        else:
+            yield ctx.trigger("set_progress", {"progress": processed / total, "label": progress_label})
+
+
+def _finalize_run(
+    ctx: ExecutionContext,
+    inf: _InferenceContext,
+    params: dict[str, object],
+) -> Generator[object, None, None]:
+    """Persist run metadata, save config, and notify/reload."""
+    if inf.log_metadata and inf.metadata:
+        runs = ctx.dataset.info.get("vllm_runs", {})
+        runs[inf.field_name] = inf.metadata
+        ctx.dataset.info["vllm_runs"] = runs
+
+    params["base_url"] = inf.base_url
+    params["api_key"] = inf.api_key
+    save_global_config(params)
+    ctx.dataset.info["_vllm_config"] = pick_params(params)
+    ctx.dataset.save()
+
+    if ctx.delegated:
+        store = ctx.store("vllm_status")
+        store.set("done", True)
+    else:
+        yield ctx.trigger("reload_dataset")
+
+
 # -- Helpers --
 
 
-def _error(ctx, message):
+def _error(ctx: ExecutionContext, message: str) -> object:
     """Yield-safe error via set_progress (raising breaks generator streams)."""
     label = f"Error: {message}"
     if ctx.delegated:
@@ -408,7 +398,83 @@ def _error(ctx, message):
     return ctx.trigger("set_progress", {"progress": 0, "label": label})
 
 
-def _resolve_config(ctx):
+def _parse_batch_responses(
+    inf: _InferenceContext,
+    batch_ids: list[str],
+    responses: list[str | Exception],
+    batch_widths: list[int | None],
+    batch_heights: list[int | None],
+) -> tuple[dict[str, object], dict[str, str], int]:
+    """Parse inference responses into results and errors.
+
+    Returns:
+        Tuple of (results dict, errors dict, error count).
+    """
+    results: dict[str, object] = {}
+    errors: dict[str, str] = {}
+    error_count = 0
+    for sid, resp, img_w, img_h in zip(batch_ids, responses, batch_widths, batch_heights):
+        if isinstance(resp, Exception):
+            errors[sid] = f"{type(resp).__name__}: {resp}"
+            error_count += 1
+            continue
+        try:
+            label = inf.task.parse_response(resp, image_width=img_w, image_height=img_h)
+            if inf.log_metadata and inf.metadata:
+                label.model_name = inf.metadata["model_name"]
+                label.prompt = inf.metadata["prompt"]
+                label.infer_cfg = inf.metadata["infer_cfg"]
+            results[sid] = label
+        except Exception as e:
+            errors[sid] = f"{type(e).__name__}: {e}"
+            error_count += 1
+    return results, errors, error_count
+
+
+def _build_metadata(
+    params: dict[str, object],
+    engine: VLLMEngine,
+    task: TaskConfig,
+    batch_size: int,
+    image_mode: str,
+) -> dict[str, object]:
+    """Build run metadata dict for per-label and dataset-level logging."""
+    full_prompt = ""
+    if task.system_prompt:
+        full_prompt += f"[system] {task.system_prompt}\n"
+    full_prompt += f"[user] {task.prompt}"
+    return {
+        "model_name": params["model"],
+        "prompt": full_prompt,
+        "infer_cfg": {
+            "temperature": engine.temperature,
+            "max_tokens": engine.max_tokens,
+            "top_p": engine.top_p,
+            "batch_size": batch_size,
+            "coordinate_format": task.coordinate_format,
+            "box_format": task.box_format,
+            "image_mode": image_mode,
+            "max_concurrent": engine.max_concurrent,
+        },
+    }
+
+
+def _clear_stale_errors(
+    dataset: fo.Dataset,
+    field_name: str,
+    ids: list[str],
+    overwrite: bool,
+) -> None:
+    """Clear stale error fields when overwriting previous results."""
+    if not overwrite:
+        return
+    error_field = f"{field_name}_error"
+    schema = dataset.get_field_schema(flat=True)
+    if error_field in schema:
+        dataset.set_values(error_field, {sid: None for sid in ids}, key_field="id")
+
+
+def _resolve_config(ctx: ExecutionContext) -> dict[str, object]:
     """Merge dataset config > global config > _DEFAULTS."""
     merged = dict(_DEFAULTS)
     for cfg in (get_global_config(), ctx.dataset.info.get("_vllm_config") or {}):
@@ -416,46 +482,58 @@ def _resolve_config(ctx):
     return merged
 
 
-def _create_engine(params, secrets):
+def _create_engine(
+    params: dict[str, object],
+    secrets: dict[str, str | None],
+) -> tuple[VLLMEngine, str, str]:
     """Build and validate a VLLMEngine from operator params and secrets.
 
     Returns (engine, base_url, api_key) — base_url/api_key needed for
     dataset.info persistence.
     """
-    api_key = params.get("api_key") or secrets.get("FIFTYONE_VLLM_API_KEY", None) or "EMPTY"
-    base_url = params.get("base_url") or secrets.get("FIFTYONE_VLLM_BASE_URL", None) or "http://localhost:8000/v1"
+    api_key = params.get("api_key") or secrets.get("FIFTYONE_VLLM_API_KEY") or "EMPTY"
+    base_url = params.get("base_url") or secrets.get("FIFTYONE_VLLM_BASE_URL") or "http://localhost:8000/v1"
 
     engine = VLLMEngine(
-        model=params["model"],
-        base_url=base_url,
-        api_key=api_key,
-        max_concurrent=params.get("max_concurrent", _DEFAULTS["max_concurrent"]),
-        temperature=params.get("temperature", None),
-        max_tokens=params.get("max_tokens", _DEFAULTS["max_tokens"]),
-        top_p=params.get("top_p", _DEFAULTS["top_p"]),
-        seed=params.get("seed", None),
+        EngineConfig(
+            model=params["model"],
+            base_url=base_url,
+            api_key=api_key,
+            max_concurrent=params.get("max_concurrent", _DEFAULTS["max_concurrent"]),
+            temperature=params.get("temperature"),
+            max_tokens=params.get("max_tokens", _DEFAULTS["max_tokens"]),
+            top_p=params.get("top_p", _DEFAULTS["top_p"]),
+            seed=params.get("seed"),
+        )
     )
     engine.validate_connection()
 
     return engine, base_url, api_key
 
 
-def _create_task(params):
+def _create_task(params: dict[str, object]) -> TaskConfig:
     """Build a TaskConfig from operator params."""
     classes = normalize_classes(params.get("classes"))
+    detection = DetectionConfig(
+        coordinate_format=params.get("coordinate_format", _DEFAULTS["coordinate_format"]),
+        box_format=params.get("box_format", _DEFAULTS["box_format"]),
+    )
 
     return TaskConfig(
         task=params["task"],
         prompt=params.get("prompt_override") or params.get("prompt"),
         system_prompt=params.get("system_prompt"),
         classes=classes,
-        coordinate_format=params.get("coordinate_format", _DEFAULTS["coordinate_format"]),
-        box_format=params.get("box_format", _DEFAULTS["box_format"]),
+        detection=detection,
         question=params.get("question", ""),
     )
 
 
-def _resolve_field_name(dataset, task_name, overwrite=False):
+def _resolve_field_name(
+    dataset: fo.Dataset,
+    task_name: str,
+    overwrite: bool = False,
+) -> str:
     """Resolve the output field name for a task run.
 
     Produces: vllm_infer_task_name, vllm_infer_task_name1, ...
@@ -482,7 +560,12 @@ def _resolve_field_name(dataset, task_name, overwrite=False):
     return f"{base}{n}"
 
 
-def _write_batch_results(dataset, field_name, results, errors):
+def _write_batch_results(
+    dataset: fo.Dataset,
+    field_name: str,
+    results: dict[str, object],
+    errors: dict[str, str],
+) -> None:
     """Write a batch of results and errors as flat sample fields.
 
     Args:
@@ -510,14 +593,59 @@ def _write_batch_results(dataset, field_name, results, errors):
 # -- UI helper functions --
 
 
-def _model_selector(ctx, inputs, stored):
-    """Add model selection field to the input form.
+def _json_config_inputs(ctx: ExecutionContext, inputs: types.Object) -> None:
+    """Add JSON paste mode UI fields and validation to the input form."""
+    inputs.str(
+        "config_json",
+        label="Paste JSON Config",
+        required=True,
+        description="Paste a config exported from a previous run",
+        view=types.CodeView(language="json"),
+    )
+    inputs.bool(
+        "show_params",
+        label="Show accepted parameters",
+        default=False,
+        view=types.SwitchView(),
+    )
+    if ctx.params.get("show_params"):
+        inputs.md(
+            "**Server:** `model`, `base_url`\n\n"
+            "**Task:** `task`, `classes`, `question`, `prompt`, "
+            "`system_prompt`, `prompt_override`\n\n"
+            "**Advanced:** `temperature`, `max_tokens`, `top_p`, "
+            "`seed`, `batch_size`, `max_concurrent`, `max_workers`, "
+            "`image_mode`, `coordinate_format`, `box_format`",
+            name="params_ref",
+        )
+    raw = ctx.params.get("config_json")
+    if raw:
+        _validate_json_config(inputs, raw)
 
-    Args:
-        ctx: operator execution context.
-        inputs: form object to populate.
-        stored: resolved config dict with defaults merged.
-    """
+
+def _validate_json_config(inputs: types.Object, raw: str) -> None:
+    """Parse and validate a JSON config string, adding status views to the form."""
+    cfg, err = parse_config_json(raw)
+    if err:
+        inputs.view("json_err", types.Error(label=err))
+        return
+    missing = [k for k in ("model", "task") if not cfg.get(k)]
+    if cfg.get("task") == "vqa" and not cfg.get("question"):
+        missing.append("question")
+    if missing:
+        inputs.view(
+            "json_warn",
+            types.Warning(label="Missing required: " + ", ".join(missing)),
+        )
+    else:
+        inputs.view(
+            "json_ok",
+            types.Notice(label=f"Valid: {cfg['task']} task with {cfg['model']}"),
+        )
+
+
+def _model_selector(inputs: types.Object, stored: dict[str, object]) -> None:
+    """Add model selection field to the input form."""
     inputs.str(
         "model",
         label="Model",
@@ -527,14 +655,8 @@ def _model_selector(ctx, inputs, stored):
     )
 
 
-def _server_settings(ctx, inputs, stored):
-    """Add server URL and API key fields to the input form.
-
-    Args:
-        ctx: operator execution context.
-        inputs: form object to populate.
-        stored: resolved config dict with defaults merged.
-    """
+def _server_settings(inputs: types.Object, stored: dict[str, object]) -> None:
+    """Add server URL and API key fields to the input form."""
     inputs.view(
         "server_header",
         types.Header(label="Server Settings", divider=True),
@@ -554,13 +676,12 @@ def _server_settings(ctx, inputs, stored):
     )
 
 
-def _task_selector(ctx, inputs, stored):
+def _task_selector(
+    ctx: ExecutionContext,
+    inputs: types.Object,
+    stored: dict[str, object],
+) -> str | None:
     """Add task dropdown to the input form.
-
-    Args:
-        ctx: operator execution context.
-        inputs: form object to populate.
-        stored: resolved config dict with defaults merged.
 
     Returns:
         Selected task name, or None if not yet chosen.
@@ -607,15 +728,12 @@ def _task_selector(ctx, inputs, stored):
     return ctx.params.get("task", None)
 
 
-def _task_settings(ctx, inputs, task, stored):
-    """Add task-specific settings (classes, question, prompt) to the form.
-
-    Args:
-        ctx: operator execution context.
-        inputs: form object to populate.
-        task: selected task name (e.g. "classify", "vqa"), or None.
-        stored: resolved config dict with defaults merged.
-    """
+def _task_settings(
+    inputs: types.Object,
+    task: str | None,
+    stored: dict[str, object],
+) -> None:
+    """Add task-specific settings (classes, question, prompt) to the form."""
     if task is None:
         return
 
@@ -654,14 +772,12 @@ def _task_settings(ctx, inputs, task, stored):
     )
 
 
-def _output_settings(ctx, inputs, task):
-    """Add output field and metadata logging settings to the form.
-
-    Args:
-        ctx: operator execution context.
-        inputs: form object to populate.
-        task: selected task name.
-    """
+def _output_settings(
+    ctx: ExecutionContext,
+    inputs: types.Object,
+    task: str | None,
+) -> None:
+    """Add output field and metadata logging settings to the form."""
     if not task or not ctx.dataset:
         return
 
@@ -703,14 +819,12 @@ def _output_settings(ctx, inputs, task):
     )
 
 
-def _advanced_settings(ctx, inputs, stored):
-    """Add collapsible advanced settings (temperature, batch size, etc.).
-
-    Args:
-        ctx: operator execution context.
-        inputs: form object to populate.
-        stored: resolved config dict with defaults merged.
-    """
+def _advanced_settings(
+    ctx: ExecutionContext,
+    inputs: types.Object,
+    stored: dict[str, object],
+) -> None:
+    """Add collapsible advanced settings (temperature, batch size, etc.)."""
     inputs.view(
         "adv_header",
         types.Header(label="Advanced Settings", divider=True),

@@ -93,3 +93,11 @@ ignore = [
 [tool.ruff.lint.pylint]
 max-branches = 6
 max-returns = 5  # prefer fewest return statements
+
+[dependency-groups]
+dev = [
+    "google-auth-httplib2>=0.3.0",
+]
+infer = [
+    "ultralytics>=8.4.21",
+]

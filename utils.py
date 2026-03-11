@@ -6,7 +6,7 @@ import base64
 import contextlib
 import json
 import mimetypes
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Executor
 from functools import partial
 from io import BytesIO
 from pathlib import Path
@@ -17,6 +17,12 @@ from fiftyone.operators.store import ExecutionStore
 
 ContentPart = dict[str, str | dict[str, str]]
 """Single content part: text block or image_url block."""
+
+_MIN_IMAGE_DIM = 512
+"""Minimum image dimension — below this VLMs produce garbage."""
+
+_MIN_IMAGE_BUDGET_TOKENS = 400
+"""Minimum image token budget before falling back to _MIN_IMAGE_DIM."""
 
 _PERSIST_KEYS = [
     "model",
@@ -105,27 +111,54 @@ def parse_config_json(json_str: str) -> tuple[dict[str, object] | None, str | No
     return {k: raw[k] for k in _PERSIST_KEYS if k in raw}, None
 
 
-def default_max_image_dim(max_model_len: int | None) -> int | None:
+def default_max_image_dim(
+    max_model_len: int | None,
+    prompt_text: str | None = None,
+    system_text: str | None = None,
+    max_tokens: int = 512,
+) -> int | None:
     """Derive max image dimension from model context length.
 
-    Uses Qwen2.5-VL's 28x28 patch tokenization as a conservative baseline.
-    Reserves 60% of context for image tokens, 40% for prompts + output.
+    Estimates prompt token usage, reserves space for output generation,
+    and allocates the remaining budget to image tokens. Uses Qwen2.5-VL's
+    28x28 patch tokenization (784 pixels/token) as baseline.
+
     Returns None if max_model_len is unknown (no resizing).
     """
     if max_model_len is None:
         return None
-    max_pixels = 0.6 * max_model_len * 28 * 28  # 60% budget, 784 px/token
-    dim = int(max_pixels**0.5)
-    return max(512, min(dim, 2048))
+
+    # Estimate text tokens: chars/4 heuristic + 64 token framing margin
+    text_tokens = sum(len(t) // 4 for t in (prompt_text or "", system_text or "") if t)
+    overhead = text_tokens + max_tokens + 64
+
+    image_budget = max_model_len - overhead
+    if image_budget < _MIN_IMAGE_BUDGET_TOKENS:
+        return _MIN_IMAGE_DIM
+
+    dim = int((image_budget * 28 * 28) ** 0.5)
+    return max(_MIN_IMAGE_DIM, dim)  # No upper cap — model context is the natural limit
 
 
 def _resize_and_encode_base64(filepath: str, max_dim: int) -> ContentPart:
     """Read, resize if needed, and base64-encode a single image file."""
 
     img = Image.open(filepath)
+
+    # Fast path: skip PIL decode/re-encode if image already fits and needs
+    # no EXIF rotation.  getexif() and .size read from the header only.
+    needs_resize = max(img.width, img.height) > max_dim
+    orientation = img.getexif().get(0x0112, 1)  # 274 = Orientation tag
+    needs_rotate = orientation not in (1, None)
+
+    if not needs_resize and not needs_rotate and img.format == "JPEG":
+        img.close()
+        return _encode_base64(filepath)
+
+    # Slow path: full decode, optional rotate/resize, re-encode
     img = ImageOps.exif_transpose(img)
-    if max(img.width, img.height) > max_dim:
-        img.thumbnail((max_dim, max_dim), Image.LANCZOS)
+    if needs_resize:
+        img.thumbnail((max_dim, max_dim), Image.BILINEAR)
     buf = BytesIO()
     if img.mode == "RGBA":
         fmt, mime = "PNG", "image/png"
@@ -140,20 +173,19 @@ def _resize_and_encode_base64(filepath: str, max_dim: int) -> ContentPart:
 
 def _encode_batch(
     paths: list[str],
-    max_workers: int,
     max_image_dim: int | None,
+    executor: Executor,
 ) -> list[ContentPart]:
     """Encode a list of local image paths in parallel, optionally resizing."""
     encoder = partial(_resize_and_encode_base64, max_dim=max_image_dim) if max_image_dim is not None else _encode_base64
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        return list(pool.map(encoder, paths))
+    return list(executor.map(encoder, paths))
 
 
 def build_image_contents(
     filepaths: list[str],
     image_mode: str = "auto",
-    max_workers: int = 4,
     max_image_dim: int | None = None,
+    executor: Executor | None = None,
 ) -> list[ContentPart]:
     """Build image content dicts for vLLM chat messages.
 
@@ -168,8 +200,8 @@ def build_image_contents(
         image_mode: "auto" | "filepath"
             - "auto": URLs pass through, local files base64-encoded
             - "filepath": URLs pass through, local files as file:// URLs
-        max_workers: ThreadPoolExecutor size for parallel base64 encoding.
         max_image_dim: max pixel size for longest side (None to skip resizing).
+        executor: process/thread pool for parallel encoding (caller-owned).
     """
     results: list[ContentPart | None] = [None] * len(filepaths)
     to_encode: list[int] = []
@@ -184,7 +216,7 @@ def build_image_contents(
 
     if to_encode:
         paths = [filepaths[i] for i in to_encode]
-        for idx, enc in zip(to_encode, _encode_batch(paths, max_workers, max_image_dim)):
+        for idx, enc in zip(to_encode, _encode_batch(paths, max_image_dim, executor)):
             results[idx] = enc
 
     return results
@@ -213,3 +245,26 @@ def _encode_base64(filepath: str) -> ContentPart:
         "type": "image_url",
         "image_url": {"url": f"data:{mime};base64,{b64}"},
     }
+
+
+def effective_dims(
+    widths: list[int | None],
+    heights: list[int | None],
+    max_dim: int,
+) -> tuple[list[int | None], list[int | None]]:
+    """Compute effective image dimensions after thumbnail resize.
+
+    Mirrors PIL's thumbnail aspect-ratio-preserving logic.
+    Returns original dims when no resize would occur.
+    """
+    eff_w: list[int | None] = []
+    eff_h: list[int | None] = []
+    for w, h in zip(widths, heights):
+        if w is not None and h is not None and max(w, h) > max_dim:
+            scale = max_dim / max(w, h)
+            eff_w.append(int(w * scale))
+            eff_h.append(int(h * scale))
+        else:
+            eff_w.append(w)
+            eff_h.append(h)
+    return eff_w, eff_h

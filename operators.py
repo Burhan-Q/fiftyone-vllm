@@ -6,8 +6,10 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Generator
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+
 
 import fiftyone.operators as foo
 from fiftyone.operators import types
@@ -21,6 +23,7 @@ from .utils import (
     build_image_contents,
     clear_global_config,
     default_max_image_dim,
+    effective_dims,
     get_global_config,
     normalize_classes,
     parse_config_json,
@@ -274,8 +277,18 @@ def _prepare_inference(
     engine.temperature = params.get("temperature") or task.default_temperature or 0.1
 
     user_max_dim = params.get("max_image_dim")
-    max_image_dim = int(user_max_dim) if user_max_dim is not None else default_max_image_dim(engine.max_model_len)
-    params["max_image_dim"] = max_image_dim
+    max_image_dim = (
+        int(user_max_dim)
+        if user_max_dim is not None
+        else default_max_image_dim(
+            engine.max_model_len,
+            prompt_text=task.prompt,
+            system_text=task.system_prompt,
+            max_tokens=engine.max_tokens,
+        )
+    )
+    if user_max_dim is not None:
+        params["max_image_dim"] = max_image_dim
 
     batch_size = params.get("batch_size", _DEFAULTS["batch_size"])
     image_mode = params.get("image_mode", _DEFAULTS["image_mode"])
@@ -299,6 +312,8 @@ def _prepare_inference(
         view.compute_metadata()
         widths = view.values("metadata.width")
         heights = view.values("metadata.height")
+        if max_image_dim is not None:
+            widths, heights = effective_dims(widths, heights, max_image_dim)
     else:
         widths = [None] * total
         heights = [None] * total
@@ -324,50 +339,72 @@ def _prepare_inference(
     return inf, None
 
 
+def _submit_encode(pool: ThreadPoolExecutor, inf: _InferenceContext, start: int) -> Future | None:
+    """Submit image encoding for a batch slice, or return None past the end."""
+    if start >= len(inf.ids):
+        return None
+    paths = inf.filepaths[start : start + inf.batch_size]
+    return pool.submit(
+        build_image_contents,
+        paths,
+        image_mode=inf.image_mode,
+        max_image_dim=inf.max_image_dim,
+        executor=pool,
+    )
+
+
 def _process_batches(
     ctx: ExecutionContext,
     inf: _InferenceContext,
 ) -> Generator[object, None, None]:
-    """Run batch inference loop with progress reporting."""
+    """Run batch inference loop with progress reporting.
+
+    Pipelines image encoding with API calls: the next batch's images are
+    encoded in a background thread while the current batch's API call is
+    in flight, hiding encoding latency after the first batch.
+    """
+
     total = len(inf.ids)
     processed = 0
     total_errors = 0
 
-    for i in range(0, total, inf.batch_size):
-        batch_ids = inf.ids[i : i + inf.batch_size]
-        batch_paths = inf.filepaths[i : i + inf.batch_size]
-        batch_widths = inf.widths[i : i + inf.batch_size]
-        batch_heights = inf.heights[i : i + inf.batch_size]
+    with ThreadPoolExecutor(max_workers=inf.max_workers) as pool:
+        pending = _submit_encode(pool, inf, 0)
 
-        image_contents = build_image_contents(
-            batch_paths,
-            image_mode=inf.image_mode,
-            max_workers=inf.max_workers,
-            max_image_dim=inf.max_image_dim,
-        )
-        batch_messages = [inf.task.build_messages(img) for img in image_contents]
-        responses = inf.engine.infer_batch(batch_messages, structured_outputs=inf.structured_outputs)
+        for i in range(0, total, inf.batch_size):
+            batch_ids = inf.ids[i : i + inf.batch_size]
+            batch_widths = inf.widths[i : i + inf.batch_size]
+            batch_heights = inf.heights[i : i + inf.batch_size]
 
-        results, errors, batch_errors = _parse_batch_responses(
-            inf,
-            batch_ids,
-            responses,
-            batch_widths,
-            batch_heights,
-        )
-        total_errors += batch_errors
+            image_contents = pending.result()
 
-        _write_batch_results(ctx.dataset, inf.field_name, results, errors)
+            # Submit next batch encoding BEFORE starting API call
+            pending = _submit_encode(pool, inf, i + inf.batch_size)
 
-        processed += len(batch_ids)
-        progress_label = f"{processed}/{total} samples"
-        if total_errors:
-            progress_label += f" ({total_errors} errors)"
+            # API call runs while next batch encodes in background
+            batch_messages = [inf.task.build_messages(img) for img in image_contents]
+            responses = inf.engine.infer_batch(batch_messages, structured_outputs=inf.structured_outputs)
 
-        if ctx.delegated:
-            ctx.set_progress(progress=processed / total, label=progress_label)
-        else:
-            yield ctx.trigger("set_progress", {"progress": processed / total, "label": progress_label})
+            results, errors, batch_errors = _parse_batch_responses(
+                inf,
+                batch_ids,
+                responses,
+                batch_widths,
+                batch_heights,
+            )
+            total_errors += batch_errors
+
+            _write_batch_results(ctx.dataset, inf.field_name, results, errors)
+
+            processed += len(batch_ids)
+            progress_label = f"{processed}/{total} samples"
+            if total_errors:
+                progress_label += f" ({total_errors} errors)"
+
+            if ctx.delegated:
+                ctx.set_progress(progress=processed / total, label=progress_label)
+            else:
+                yield ctx.trigger("set_progress", {"progress": processed / total, "label": progress_label})
 
 
 def _finalize_run(
@@ -898,7 +935,7 @@ def _advanced_settings(
         default=stored.get("max_workers"),
         min=1,
         max=32,
-        description=("Thread pool size for parallel image loading/encoding"),
+        description=("Process pool size for parallel image loading/encoding"),
     )
 
     image_dropdown = types.Dropdown()

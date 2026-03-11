@@ -17,11 +17,11 @@ services:
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
     ipc: host
-    command: --model Qwen/Qwen2.5-VL-3B-Instruct-AWQ --max-model-len 8192 --gpu-memory-utilization 0.6
+    command: --model Qwen/Qwen2.5-VL-7B-Instruct-AWQ --max-model-len 8192 --gpu-memory-utilization 0.75 --mm-encoder-tp-mode data --tool-call-parser hermes
     # command: --model google/gemma-3-4b-it --max-model-len 8192 --gpu-memory-utilization 0.6  # NOTE: must agree to access repo
 
     # NOTE Qwen3.5 support requires transformers>5, but vllm==0.16.0 (latest) is pinned at transformers<5
     # command: --model Qwen/Qwen3.5-4B --max-model-len 8192 --gpu-memory-utilization 0.6 --mm-encoder-tp-mode data --mm-processor-cache-type shm --reasoning-parser qwen3 --enable-prefix-caching
 
     # NOTE: Qwen3-VL might need additional GPU memory headroom (increase utilization)
-    # command: --model Qwen/Qwen3-VL-8B-Instruct-FP8 --max-model-len 8192 --gpu-memory-utilization 0.6
+    # command: --model Qwen/Qwen3-VL-8B-Instruct-FP8 --max-model-len 8192 --gpu-memory-utilization 0.75 --async-scheduling
